@@ -1,24 +1,23 @@
 # Core web framework
-flask==2.3.3
-flask-cors==4.0.0
+flask
+flask-cors
 
 # HTTP requests
-requests==2.31.0
+requests
 
 # Data manipulation
-pandas==2.0.3
+pandas
 
 # AI/ML frameworks
 langchain
 langchain-openai
-langchain-experimental==0.0.62
-openai==1.35.0
+langchain-experimental
+openai
 
 # Environment variables
-python-dotenv==1.0.0
-
+python-dotenv
 # Database
-pymongo==4.5.0
+pymongo
 
 # Built-in modules (no installation needed)
 # base64, getpass, os, json, time, datetime, urllib.parse, secrets, hashlib
