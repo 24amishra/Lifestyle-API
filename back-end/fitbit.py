@@ -25,9 +25,8 @@ from urllib.parse import quote, urlencode
 from pymongo import MongoClient
 import time
 
-uri = "mongodb+srv://agastyamishra2006:324Am021@cluster0.tqztm.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
-client = MongoClient(uri)
+client = MongoClient(os.getenv("MONGO_URI"))
 db = client['FitAuth']
 collection = db['Details']
 

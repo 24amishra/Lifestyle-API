@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import HistogramChart from './graph.js';
 import { redirect } from "next/dist/server/api-utils/index.js";
 import { useRouter } from 'next/navigation.js'
+
  
 
 export default function Home() {
@@ -12,6 +13,9 @@ export default function Home() {
   const [dates, setDates] = useState(["6-17-25", "6-18-25", "6-19-25", "6-20-25"]);
   const [today, setToday] = useState(null);
   const router = useRouter();
+  const API_BASE_URL = process.env.NODE_ENV === 'production' 
+  ? 'https://lifestyle-api.onrender.com/'
+  : 'http://localhost:5000';
   
 const getAuth = async () =>{
  router.push('/auth')
@@ -23,7 +27,7 @@ const getAuth = async () =>{
   const getData = async () => {
     setLoading(true);
     try {
-      const response = await fetch("http://127.0.0.1:8000/endpoint");
+      const response = await fetch(`${API_BASE_URL}/endpoint`);
       const data = await response.json();
       console.log(data.evaluation);
       setRes(data.evaluation);
