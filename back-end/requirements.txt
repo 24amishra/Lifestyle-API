@@ -20,5 +20,9 @@ python-dotenv
 # Database
 pymongo
 
+gunicorn==21.2.0
+FLASK_ENV = production
+
+
 # Built-in modules (no installation needed)
 # base64, getpass, os, json, time, datetime, urllib.parse, secrets, hashlib

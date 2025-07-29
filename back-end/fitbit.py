@@ -34,8 +34,7 @@ collection = db['Details']
 
 app = Flask(__name__)
 app.secret_key = "Pluto@1234"
-CORS(app, origins=["http://localhost:3000"], supports_credentials=True,
-  allow_headers=["Content-Type", "Authorization"], methods=["GET", "POST", "OPTIONS"])
+CORS(app)
 
 def save_tokens(access_token, refresh_token, client_id="23QFHC", user_id=None):
     """
@@ -174,7 +173,7 @@ def callback():
 
     client_id = os.getenv("FITBIT_CLIENT_ID")
     client_secret = os.getenv("CLIENT_SECRET")
-    redirect_uri = "http://localhost:8000/callback"
+    redirect_uri = os.getenv("REDIRECT_URI")
 
     token_url = "https://api.fitbit.com/oauth2/token"
     headers = {
@@ -508,4 +507,7 @@ COMPREHENSIVE FITBIT HEALTH DATA SUMMARY for {date}
 if __name__ == '__main__':
 
     app.run(port=8000, debug=True)
+    import os
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
 
