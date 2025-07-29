@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import HistogramChart from './graph.js';
 import { redirect } from "next/dist/server/api-utils/index.js";
-import { useRouter } from 'next/navigation'
+import { useRouter } from 'next/navigation.js'
  
 
 export default function Home() {

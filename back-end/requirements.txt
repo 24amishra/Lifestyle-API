@@ -1,0 +1,24 @@
+# Core web framework
+flask
+flask-cors
+
+# HTTP requests
+requests
+
+# Data manipulation
+pandas
+
+# AI/ML frameworks
+langchain
+langchain-openai
+langchain-experimental
+openai
+
+# Environment variables
+python-dotenv
+
+# Database
+pymongo
+
+# Built-in modules (no installation needed)
+# base64, getpass, os, json, time, datetime, urllib.parse, secrets, hashlib
