@@ -21,7 +21,7 @@ python-dotenv
 pymongo
 
 gunicorn==21.2.0
-FLASK_ENV = production
+
 
 
 # Built-in modules (no installation needed)
