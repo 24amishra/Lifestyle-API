@@ -33,7 +33,10 @@ collection = db['Details']
 
 app = Flask(__name__)
 app.secret_key = "Pluto@1234"
-CORS(app)
+CORS(app, origins=[
+    "https://lifestyle-api-2.onrender.com/",  # Your actual frontend URL
+    "http://localhost:3000"  # For local development
+])
 
 def save_tokens(access_token, refresh_token, client_id="23QFHC", user_id=None):
     """
