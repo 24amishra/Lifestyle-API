@@ -56,7 +56,7 @@ const getAuth = async () =>{
       
       <div className="text-center space-y-2">
         <p className="text-xl font-semibold">Welcome !</p>
-        <p className="text-gray-600">Today's date: {today}</p>
+        <p className="text-gray-600">Today&apos;s date: {today}</p>
       </div>
 
       <div className="w-full max-w-3xl space-y-4">
