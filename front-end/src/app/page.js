@@ -27,7 +27,7 @@ const getAuth = async () =>{
   const getData = async () => {
     setLoading(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/endpoint`);
+      const response = await fetch(`${API_BASE_URL}endpoint`);
       const data = await response.json();
       console.log(data.evaluation);
       setRes(data.evaluation);
