@@ -14,7 +14,7 @@ export default function Home() {
   const [today, setToday] = useState(null);
   const router = useRouter();
   const API_BASE_URL = process.env.NODE_ENV === 'production' 
-  ? 'https://lifestyle-api.onrender.com/'
+  ? 'https://lifestyle-api.onrender.com'
   : 'http://localhost:5000';
   
 const getAuth = async () =>{
