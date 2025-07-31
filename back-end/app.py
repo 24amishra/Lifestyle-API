@@ -219,7 +219,7 @@ def authorize():
     session['code_challenge'] = code_challenge  # You don't actually need to store this
     
     client_id = os.getenv("FITBIT_CLIENT_ID")
-    redirect_uri = "https://lifestyle-api.onrender.com/callback"
+    redirect_uri = "https://first-production-254a.up.railway.app/callback"
     scope = "activity heartrate sleep profile"
     
     # Use urlencode to properly format the URL
