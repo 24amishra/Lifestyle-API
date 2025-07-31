@@ -24,10 +24,7 @@ import base64
 from urllib.parse import quote, urlencode
 from pymongo import MongoClient
 import time
-<<<<<<< HEAD
 import gc
-=======
->>>>>>> f69bc2929b7ae65774a8433302d9de39d55af325
 
 
 client = MongoClient(os.getenv("MONGO_URI"))
