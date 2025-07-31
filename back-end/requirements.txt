@@ -18,7 +18,8 @@ openai
 python-dotenv
 
 # Database
-pymongo
+pymongo>=4.0
+dnspython>=2.0
 
 gunicorn==21.2.0
 
