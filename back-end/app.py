@@ -113,6 +113,15 @@ CITY_PATTERN = re.compile(r"^[a-zA-Z\s\-'.]+$")
 # Chunks with distance > this value are considered off-topic and dropped.
 RAG_DISTANCE_THRESHOLD = 0.75
 
+# More lenient threshold used exclusively for surfacing animation cards.
+# A chunk doesn't need to be relevant enough to inform the LLM's answer to
+# still warrant showing the user a related video.
+ANIMATION_SURFACE_THRESHOLD = 0.82
+
+# Maximum number of animation cards to surface per response.
+# Prevents overwhelming the user when a broad question matches many videos.
+MAX_ANIMATIONS_PER_RESPONSE = 2
+
 rate_limit_store: dict = {}
 RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_MAX = 20
@@ -263,16 +272,14 @@ def retrieve_context(
 
     chunk_details = []
     context_parts = []
-    animations: list = []          # structured list returned separately from context
-    seen_anim_urls: set = set()   # deduplicate across chunks
+    animations: list = []
+    seen_anim_urls: set = set()
     used_count = 0
 
     for i, chunk in enumerate(raw_chunks):
         distance = distances[i] if i < len(distances) else 1.0
-        # Guard against None metadata (can happen with old pre-schema chunks)
         meta = (metadatas[i] if i < len(metadatas) else None) or {}
 
-        # Convert pipe-separated reference_urls to a list for readability
         ref_urls_raw = meta.get("reference_urls", "")
         ref_urls_list = [u for u in ref_urls_raw.split("|||") if u] if ref_urls_raw else []
 
@@ -291,22 +298,29 @@ def retrieve_context(
             },
         })
 
+        # ----------------------------------------------------------------
+        # Animation surfacing — intentionally decoupled from use_chunk.
+        # Uses ANIMATION_SURFACE_THRESHOLD (more lenient than the context
+        # threshold) so a video can surface even when its chunk was too
+        # marginal to include in the LLM context.
+        # ----------------------------------------------------------------
+        anim_url = meta.get("animation_url", "")
+        section_title = meta.get("section_title", "")
+        if (
+            anim_url
+            and anim_url not in seen_anim_urls
+            and distance <= ANIMATION_SURFACE_THRESHOLD
+            and len(animations) < MAX_ANIMATIONS_PER_RESPONSE
+        ):
+            animations.append({"title": section_title, "url": anim_url})
+            seen_anim_urls.add(anim_url)
+
         if not use_chunk:
             continue
 
         used_count += 1
         block = chunk
 
-        # Animation links are returned as structured data in the `animations`
-        # field — they are never injected into the context string the LLM sees.
-        # This avoids post-processing and keeps the context clean.
-        anim_url = meta.get("animation_url", "")
-        section_title = meta.get("section_title", "")
-        if anim_url and anim_url not in seen_anim_urls:
-            animations.append({"title": section_title, "url": anim_url})
-            seen_anim_urls.add(anim_url)
-
-        # Append reference URLs only when user explicitly asked for sources
         if include_references and ref_urls_list:
             refs_str = "\n".join(f"- {u}" for u in ref_urls_list[:5])
             block += f"\n\n\U0001f4da References for this section:\n{refs_str}"
@@ -709,23 +723,29 @@ sleep, and heart-rate when relevant."""
 
     system_prompt = f"""You are a supportive, evidence-based health coach chatbot designed primarily
 for men who are currently undergoing prostate cancer treatment or who have survived
-prostate cancer. You also serve cancer survivors more broadly.
+prostate cancer. You also serve cancer survivors more broadly. You cover two core
+pillars: physical activity and nutrition.
 
 YOUR ROLE:
-- Provide exercise and physical activity recommendations appropriate for their
-  cancer journey, being mindful of treatment side effects common in prostate cancer.
-- Help users set SMART goals (Specific, Measurable, Achievable, Relevant, Time-bound).
-- Use Motivational Interviewing: ask open-ended questions, use reflective listening,
-  affirm effort and autonomy, never lecture or push. Let the user arrive at their
-  own conclusions.
-- Support emotional well-being alongside physical health.
+- Exercise and physical activity recommendations appropriate for cancer survivors,
+  mindful of treatment side effects common in prostate cancer.
+- Nutrition and healthy eating guidance: food choices, meal planning, reading
+  labels, building a balanced plate, grocery shopping, and debunking common
+  food myths — all grounded in the provided literature.
+- Setting SMART goals (Specific, Measurable, Achievable, Relevant, Time-bound).
+- Motivational Interviewing: ask open-ended questions, use reflective listening,
+  affirm effort and autonomy, never lecture or push.
+- Supporting emotional well-being alongside physical health.
 
 BEHAVIOR GUIDELINES:
 - Always be sensitive to the physical and emotional realities of living with or
   recovering from cancer.
-- If a user mentions symptoms, treatment side effects, or medical concerns,
-  acknowledge them supportively and recommend they discuss specifics with their
-  care team. Never diagnose, prescribe, or contradict medical advice.
+- "Medical concerns" that should be redirected to the care team means: specific
+  symptoms, treatment decisions, medication interactions, supplement dosages,
+  or anything requiring clinical judgement. It does NOT mean general nutrition
+  advice, healthy eating patterns, food choices, or exercise guidance — those
+  are squarely within your role and should be answered from the context.
+- Never diagnose, prescribe, or contradict medical advice.
 - Do not provide specific dosages for supplements or medications.
 - If a user appears to be in crisis or mentions self-harm, respond with empathy
   and direct them to appropriate emergency resources (988 Suicide & Crisis Lifeline,
@@ -736,7 +756,7 @@ You must answer exclusively from the CONTEXT FROM HEALTH LITERATURE section belo
 This context comes from two source types:
   1. Peer-reviewed research papers and clinical guidelines (your factual backbone).
   2. Educational animation transcripts written for patients (plain-language summaries
-     of the same evidence, sometimes with a 📹 animation link attached).
+     of the same evidence).
 
 You must NOT:
 - Draw on your training knowledge, even for facts you are confident about.
@@ -744,10 +764,15 @@ You must NOT:
 - Speculate or extrapolate beyond what the provided documents explicitly state.
 - Fabricate or guess any URL.
 
-If the context says "No sufficiently relevant information was found" or is otherwise
-silent on a topic, respond with:
-"I don't have information on that in my knowledge base. Please check with your
-healthcare provider for guidance on that topic."
+When to use the context vs. when to defer:
+- If relevant context is present — even partially — USE it to answer. Do not
+  say you lack information just because the context does not answer every detail.
+- Only respond with "I don’t have information on that in my knowledge base.
+  Please check with your healthcare provider." when the context is genuinely
+  empty or contains only unrelated content AND the question requires clinical
+  judgement (symptoms, treatment, medication).
+- For questions about nutrition, food, exercise, sleep, or stress where the
+  context has relevant content, always answer from that content.
 
 CURRENT WEATHER & TIME:
 Time: {time_str}
@@ -817,6 +842,7 @@ RESPONSE FORMAT:
             ),
             "total_candidates": len(retrieved_chunks),
             "distance_threshold": RAG_DISTANCE_THRESHOLD,
+            "animation_threshold": ANIMATION_SURFACE_THRESHOLD,
             "error": rag_error,
             "animations_surfaced": animations,
             "context_sent_to_llm": context,

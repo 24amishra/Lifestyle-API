@@ -264,8 +264,11 @@ export default function Home() {
                           {chunksByMessage[i].context_chunks_count} of{" "}
                           {chunksByMessage[i].total_candidates} candidates
                           &nbsp;·&nbsp;
-                          <span className="font-semibold">Threshold:</span>{" "}
+                          <span className="font-semibold">Context threshold:</span>{" "}
                           {chunksByMessage[i].distance_threshold}
+                          &nbsp;·&nbsp;
+                          <span className="font-semibold">Animation threshold:</span>{" "}
+                          {chunksByMessage[i].animation_threshold}
                         </p>
                         {chunksByMessage[i].animations_surfaced?.length > 0 && (
                           <p>
