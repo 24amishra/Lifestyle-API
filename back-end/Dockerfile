@@ -13,4 +13,4 @@ ENV FLASK_RUN_PORT=5000
 
 EXPOSE 5000
 
-CMD ["python", "app.py"]
+CMD ["sh", "entrypoint.sh"]

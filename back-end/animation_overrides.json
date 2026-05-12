@@ -1,0 +1,11 @@
+{
+  "_readme": "Add the Vimeo URL for each animation below, then run: python apply_overrides.py. Only animations with missing or broken links need to be listed here — ones already embedded in the PDF are handled automatically by ingest.py. Section titles must match exactly as they appear in the PDF.",
+  "animations": {
+    "Movement is Life": "",
+    "Nutrition Unmasked: Debunking Common Food Myths": "",
+    "Flexibility and Stretching": "",
+    "Importance of Sleep Recommendations (OLD)": "",
+    "Sleep Hygiene": "",
+    "Stress: The Good and the Bad": ""
+  }
+}

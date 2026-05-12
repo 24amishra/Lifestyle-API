@@ -7,16 +7,18 @@ requests
 
 # AI/ML
 openai
+langchain-openai
 
 # Vector database (for RAG)
 chromadb
 
 # Text splitting
-langchain
+langchain-text-splitters
 langchain-community
 
 # PDF reading (for ingesting literature)
 pypdf
+cryptography>=3.1
 
 # Environment variables
 python-dotenv

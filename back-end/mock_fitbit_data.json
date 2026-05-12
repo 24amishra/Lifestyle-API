@@ -1,0 +1,15 @@
+{
+  "activity": {
+    "steps": 10234,
+    "calories_out": 2320,
+    "active_minutes": 65,
+    "distance_km": 7.8
+  },
+  "sleep": {
+    "total_minutes_asleep": 437,
+    "total_time_in_bed": 467
+  },
+  "heart_rate": {
+    "resting_heart_rate": 61
+  }
+}

@@ -10,8 +10,13 @@ services:
       FLASK_DEBUG: "1"
       FRONTEND_URL: "http://localhost:3000"
       REDIRECT_URI: "http://localhost:5000/callback"
+      USE_MOCK_FITBIT: "1"
     volumes:
-      - ./back-end:/app
+      - ./back-end/app.py:/app/app.py
+      - ./back-end/ingest.py:/app/ingest.py
+      - ./back-end/mock_fitbit_data.json:/app/mock_fitbit_data.json
+      - ./back-end/documents:/app/documents
+      - backend-chroma:/app/chroma_db
     depends_on: []
 
   frontend:
@@ -25,7 +30,10 @@ services:
       CHOKIDAR_USEPOLLING: "true"
       WATCHPACK_POLLING: "true"
     volumes:
-      - ./front-end:/app
+      - ./front-end/src:/app/src
       - /app/node_modules
     depends_on:
       - backend
+
+volumes:
+  backend-chroma:
