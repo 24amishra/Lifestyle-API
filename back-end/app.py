@@ -126,6 +126,20 @@ rate_limit_store: dict = {}
 RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_MAX = 20
 
+# Phrases that signal a message is a follow-up / back-reference rather than
+# a self-contained question. Used by _build_rag_query to decide whether to
+# enrich the embedding query with prior context.
+# Examples that match: "tell me more about that", "what about it?",
+#                      "can you elaborate?", "those sound good"
+# Examples that don't: "what exercises should I do today?",
+#                      "what should I eat this week?"
+FOLLOWUP_PATTERN = re.compile(
+    r"\b(more|that|it|those|them|this|above|mentioned|earlier|again|"
+    r"else|other|another|continue|elaborate|expand|go on|previous|"
+    r"same|similar|related|what about|how about)\b",
+    re.IGNORECASE,
+)
+
 # Phrases that signal the user is explicitly asking for research sources.
 # Deliberately narrow — common health words like "data" are excluded so
 # routine messages don't accidentally trigger reference injection.
@@ -201,14 +215,24 @@ def sanitize_history(history: list) -> list:
 def _build_rag_query(user_message: str, history: list) -> str:
     """
     Build a richer embedding query by combining the current user message
-    with the tail of recent conversation.
+    with the tail of recent conversation — but only when the message is
+    genuinely decontextualized.
 
-    Short or decontextualized messages like "tell me more about that" produce
-    poor embeddings on their own. Prepending the last assistant turn gives the
-    retrieval model enough topic signal to find the right chunks.
+    A message needs enrichment when it's both short AND contains a
+    back-reference signal (e.g. "tell me more about that", "what about it?").
+    Self-contained questions like "What exercises should I do today?" are
+    used as-is regardless of word count, preventing prior-topic context
+    (e.g. a nutrition answer) from polluting the embedding and surfacing
+    irrelevant video cards.
     """
-    if len(user_message.split()) >= 8:
-        # Message is long enough to be self-contained
+    word_count = len(user_message.split())
+    is_short = word_count <= 5
+    is_followup = bool(FOLLOWUP_PATTERN.search(user_message))
+
+    # Only enrich if the message is both short AND has a back-reference signal.
+    # A long message is always self-contained.
+    # A short message with no back-reference is still a standalone question.
+    if not (is_short and is_followup):
         return user_message
 
     # Find the most recent assistant message in history
