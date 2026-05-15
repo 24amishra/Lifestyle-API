@@ -843,8 +843,25 @@ RESPONSE FORMAT:
         )
         reply = response.choices[0].message.content
     except Exception as e:
-        logger.error("OpenAI call failed: %s", e)
-        return jsonify({"error": "AI call failed"}), 500
+        # If gpt-4o-mini is rate-limited (429), fall back to gpt-3.5-turbo
+        # which has a separate daily quota bucket.
+        from openai import RateLimitError
+        if isinstance(e, RateLimitError):
+            logger.warning("gpt-4o-mini rate limited, falling back to gpt-3.5-turbo: %s", e)
+            try:
+                response = openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=messages,
+                    max_tokens=600,
+                    temperature=0.4,
+                )
+                reply = response.choices[0].message.content
+            except Exception as fallback_e:
+                logger.error("gpt-3.5-turbo fallback also failed: %s", fallback_e)
+                return jsonify({"error": "AI call failed"}), 500
+        else:
+            logger.error("OpenAI call failed: %s", e)
+            return jsonify({"error": "AI call failed"}), 500
 
     updated_history = truncated_history + [
         {"role": "user", "content": user_message},

@@ -65,7 +65,7 @@ function AnimationCards({ animations }) {
 export default function Home() {
   const [mounted, setMounted] = useState(false);
   const [messages, setMessages] = useState([
-    { role: "assistant", content: "Hi! I'm your health coach. How can I help you today?" }
+    { role: "assistant", content: "Hi! How can I help you today?" }
   ]);
   const [history, setHistory] = useState([]);
   const [input, setInput] = useState("");
@@ -183,8 +183,7 @@ export default function Home() {
       {/* Header */}
       <div className="bg-white border-b px-6 py-4 flex items-center justify-between shadow-sm">
         <div>
-          <h1 className="text-lg font-semibold text-gray-800">Health Coach</h1>
-          <p className="text-xs text-gray-400">Powered by your literature</p>
+          <h1 className="text-lg font-semibold text-gray-800">Health Chatbot</h1>
         </div>
         <div className="flex items-center gap-3">
           <input
@@ -288,7 +287,7 @@ export default function Home() {
                             <summary className="cursor-pointer font-semibold text-gray-700 hover:text-gray-900">
                               Raw context sent to LLM
                             </summary>
-                            <pre className="mt-1 whitespace-pre-wrap break-words text-gray-600 bg-white border border-gray-200 rounded p-2 max-h-64 overflow-y-auto">
+                            <pre className="mt-1 whitespace-pre-wrap wrap-break-word text-gray-600 bg-white border border-gray-200 rounded p-2 max-h-64 overflow-y-auto">
                               {chunksByMessage[i].context_sent_to_llm}
                             </pre>
                           </details>

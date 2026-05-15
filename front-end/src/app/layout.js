@@ -12,7 +12,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata = {
-  title: "Health Coach",
+  title: "Health Chatbot",
   description: "AI-powered health coach chatbot with RAG and Fitbit integration",
 };
 
