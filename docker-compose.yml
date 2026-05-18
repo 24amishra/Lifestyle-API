@@ -14,6 +14,8 @@ services:
     volumes:
       - ./back-end/app.py:/app/app.py
       - ./back-end/ingest.py:/app/ingest.py
+      - ./back-end/apply_overrides.py:/app/apply_overrides.py
+      - ./back-end/animation_overrides.json:/app/animation_overrides.json
       - ./back-end/mock_fitbit_data.json:/app/mock_fitbit_data.json
       - ./back-end/documents:/app/documents
       - backend-chroma:/app/chroma_db

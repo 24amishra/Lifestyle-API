@@ -4,20 +4,23 @@ apply_overrides.py
 Patches animation URLs directly in ChromaDB without re-running a full ingest.
 
 Usage:
-  1. Open animation_overrides.json and fill in the Vimeo URL for each animation.
-  2. Run:  python apply_overrides.py
+  # See all section titles currently stored in ChromaDB (run this first):
+  docker-compose exec backend python apply_overrides.py --list
 
-Only chunks whose section_title matches a key in animation_overrides.json are
-touched. Everything else (embeddings, text, reference URLs, research PDFs) is
-left completely unchanged.
+  # Apply the URLs from animation_overrides.json:
+  docker-compose exec backend python apply_overrides.py
 
-Safe to run multiple times — re-running with the same URLs is a no-op in effect,
-it just overwrites the metadata with the same values.
+Titles in animation_overrides.json must match the stored section_title exactly.
+If a title is not found, the script prints the closest match from ChromaDB to
+help you correct it.
+
+Safe to re-run — overwriting with the same URL is a no-op in effect.
 """
 
 import json
 import os
 import sys
+import difflib
 from dotenv import load_dotenv
 import chromadb
 
@@ -28,39 +31,10 @@ OVERRIDES_FILE = os.path.join(_HERE, "animation_overrides.json")
 CHROMA_PATH = os.path.join(_HERE, "chroma_db")
 
 
-def load_overrides(filepath: str) -> dict:
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        print(f"ERROR: {filepath} not found.")
-        sys.exit(1)
-    except json.JSONDecodeError as e:
-        print(f"ERROR: {filepath} is not valid JSON — {e}")
-        sys.exit(1)
-
-    animations = data.get("animations", {})
-    if not animations:
-        print("No 'animations' key found in overrides file.")
-        sys.exit(1)
-
-    # Skip blank entries so a half-filled file doesn't wipe existing URLs
-    active = {title: url for title, url in animations.items() if url.strip()}
-    skipped = [title for title, url in animations.items() if not url.strip()]
-
-    if skipped:
-        print(f"Skipping {len(skipped)} blank entries (no URL provided yet):")
-        for t in skipped:
-            print(f"  - {t}")
-        print()
-
-    return active
-
-
-def apply_overrides(overrides: dict) -> None:
+def get_collection():
     try:
         client = chromadb.PersistentClient(path=CHROMA_PATH)
-        collection = client.get_collection("health_docs")
+        return client.get_collection("health_docs")
     except Exception as e:
         print(
             f"ERROR: Could not open ChromaDB collection at '{CHROMA_PATH}'.\n"
@@ -68,10 +42,68 @@ def apply_overrides(overrides: dict) -> None:
         )
         sys.exit(1)
 
+
+def all_section_titles(collection) -> list:
+    """Return every unique non-empty section_title stored in ChromaDB, sorted."""
+    try:
+        # Fetch all metadata in batches — ChromaDB has no GROUP BY, so we page
+        limit = 500
+        offset = 0
+        titles = set()
+        while True:
+            batch = collection.get(
+                limit=limit,
+                offset=offset,
+                include=["metadatas"],
+            )
+            metas = batch.get("metadatas") or []
+            if not metas:
+                break
+            for m in metas:
+                if m and m.get("section_title"):
+                    titles.add(m["section_title"])
+            if len(metas) < limit:
+                break
+            offset += limit
+        return sorted(titles)
+    except Exception as e:
+        print(f"ERROR fetching section titles: {e}")
+        sys.exit(1)
+
+
+def load_overrides() -> dict:
+    try:
+        with open(OVERRIDES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"ERROR: {OVERRIDES_FILE} not found.")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: {OVERRIDES_FILE} is not valid JSON — {e}")
+        sys.exit(1)
+
+    animations = data.get("animations", {})
+    if not animations:
+        print("No 'animations' key found in overrides file.")
+        sys.exit(1)
+
+    active = {t: u for t, u in animations.items() if u.strip()}
+    skipped = [t for t, u in animations.items() if not u.strip()]
+
+    if skipped:
+        print(f"Skipping {len(skipped)} blank entries (no URL provided):")
+        for t in skipped:
+            print(f"  - {t}")
+        print()
+
+    return active
+
+
+def apply_overrides(overrides: dict, collection, stored_titles: list) -> None:
     total_updated = 0
+    not_found = []
 
     for title, new_url in overrides.items():
-        # Fetch all chunks that belong to this animation section
         try:
             results = collection.get(
                 where={"section_title": {"$eq": title}},
@@ -85,14 +117,9 @@ def apply_overrides(overrides: dict) -> None:
         metadatas = results.get("metadatas", [])
 
         if not ids:
-            print(f"  ⚠  No chunks found for: '{title}'")
-            print(
-                "     Check that the title matches exactly — "
-                "copy it from the PDF section header."
-            )
+            not_found.append(title)
             continue
 
-        # Patch animation_url in every chunk's metadata, leave everything else alone
         updated_metadatas = []
         for meta in metadatas:
             patched = dict(meta)
@@ -101,23 +128,48 @@ def apply_overrides(overrides: dict) -> None:
 
         try:
             collection.update(ids=ids, metadatas=updated_metadatas)
-            print(f"  ✓  Updated {len(ids):>3} chunks  →  '{title}'")
-            print(f"          URL: {new_url}")
+            print(f"  ✓  {len(ids):>3} chunks  →  {title}")
             total_updated += len(ids)
         except Exception as e:
             print(f"  ERROR updating chunks for '{title}': {e}")
 
     print(f"\nDone. {total_updated} chunk(s) updated in ChromaDB.")
-    print("No re-embedding needed — restart Flask to pick up the changes.")
+
+    # Report titles that didn't match, with closest suggestions
+    if not_found:
+        print(f"\n⚠  {len(not_found)} title(s) had no matching chunks in ChromaDB.")
+        print("   Update animation_overrides.json to use the exact stored title.\n")
+        for title in not_found:
+            matches = difflib.get_close_matches(title, stored_titles, n=2, cutoff=0.4)
+            print(f"  NOT FOUND: '{title}'")
+            if matches:
+                for m in matches:
+                    print(f"    → Did you mean: '{m}'")
+            else:
+                print(f"    → No close match found. Run --list to see all stored titles.")
+            print()
 
 
 if __name__ == "__main__":
-    print(f"Loading overrides from: {OVERRIDES_FILE}\n")
-    overrides = load_overrides(OVERRIDES_FILE)
-
-    if not overrides:
-        print("Nothing to apply — all entries are blank. Add URLs to animation_overrides.json first.")
+    if "--list" in sys.argv:
+        print(f"Connecting to ChromaDB at: {CHROMA_PATH}\n")
+        col = get_collection()
+        titles = all_section_titles(col)
+        print(f"Found {len(titles)} unique section title(s) in ChromaDB:\n")
+        for t in titles:
+            print(f"  {t}")
         sys.exit(0)
 
+    print(f"Loading overrides from: {OVERRIDES_FILE}\n")
+    overrides = load_overrides()
+
+    if not overrides:
+        print("Nothing to apply — all entries are blank.")
+        sys.exit(0)
+
+    col = get_collection()
+    stored = all_section_titles(col)
+
     print(f"Applying {len(overrides)} override(s):\n")
-    apply_overrides(overrides)
+    apply_overrides(overrides, col, stored)
+    print("\nNo re-embedding needed. Restart Flask to pick up the changes.")
