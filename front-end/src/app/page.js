@@ -27,7 +27,6 @@ function renderInlineMarkdown(text) {
     lastIndex = match.index + match[0].length;
   }
   if (lastIndex < text.length) result.push(text.slice(lastIndex));
-  // Wrap in a fragment so React 19 hydration never sees a raw array
   return <>{result}</>;
 }
 
@@ -62,6 +61,79 @@ function AnimationCards({ animations }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// SAMPLE LE8 DATA
+//
+// This object is sent to the backend as `le8_data` on every chat request.
+// It matches the exact shape that GET /api/health-scores returns from the
+// mHealthy Hearts backend, so when you are ready to integrate, the only
+// change needed is replacing this constant with a real API call:
+//
+//   const le8Data = await fetch("https://mhealthyhearts.com/api/health-scores")
+//                         .then(r => r.json());
+//
+// Then pass `le8_data: le8Data` instead of `le8_data: SAMPLE_LE8_DATA`.
+// Nothing in the Flask backend needs to change.
+//
+// The sample below intentionally covers a range of tiers (Ideal / Intermediate)
+// and includes one missing metric (diet) and secondhand smoke exposure, so
+// you can test all chatbot behaviors from a single session.
+// ---------------------------------------------------------------------------
+const SAMPLE_LE8_DATA = {
+  composite_score: 74,
+  metrics: {
+    // Pulled from Fitbit — Intermediate (75 pts)
+    physical_activity: {
+      steps: 7500,
+      goal: 10000,
+      score: 75,
+    },
+    // Pulled from Fitbit — Ideal (81 pts)
+    sleep: {
+      hours: 6.5,
+      score: 81,
+    },
+    // Sample blood pressure — Ideal (90 pts)
+    // TO WIRE UP: replace with Omron data from mHealthy Hearts
+    blood_pressure: {
+      systolic: 126,
+      diastolic: 78,
+      score: 90,
+    },
+    // User-entered — Intermediate (60 pts, just above the 100-pt threshold)
+    blood_sugar: {
+      test_type: "fasting_glucose",
+      value: 104,
+      unit: "mg/dL",
+      has_diabetes: false,
+      score: 60,
+    },
+    // User-entered — Intermediate (60 pts)
+    blood_lipids: {
+      non_hdl: 145,
+      unit: "mg/dL",
+      score: 60,
+    },
+    // User-entered — Intermediate (70 pts, overweight range)
+    bmi: {
+      height_in: 67,
+      weight_lbs: 175,
+      bmi_value: 27.4,
+      score: 70,
+    },
+    // null = user has not completed the diet assessment yet
+    // Tests the "missing metric" flagging behavior
+    diet: null,
+    // Never smoked BUT secondhand exposure in home — scores 80 not 100
+    // Tests the counterintuitive secondhand smoke explanation
+    smoking: {
+      status: "never",
+      secondhand_exposure: true,
+      score: 80,
+    },
+  },
+};
+
 export default function Home() {
   const [mounted, setMounted] = useState(false);
   const [messages, setMessages] = useState([
@@ -72,7 +144,6 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [city, setCity] = useState("Columbus");
   const [fitbitConnected, setFitbitConnected] = useState(false);
-  const [userDocId, setUserDocId] = useState(null);
   const [showChunks, setShowChunks] = useState(false);
   const [chunksByMessage, setChunksByMessage] = useState({});
   const [animationsByMessage, setAnimationsByMessage] = useState({});
@@ -82,8 +153,6 @@ export default function Home() {
 
   const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
 
-  // Mount guard — prevents SSR/CSR hydration mismatch.
-  // The server renders a blank shell; the full UI only renders on the client.
   useEffect(() => setMounted(true), []);
 
   useEffect(() => {
@@ -94,8 +163,6 @@ export default function Home() {
     const params = new URLSearchParams(window.location.search);
     if (params.get("fitbit") === "connected") {
       setFitbitConnected(true);
-      const uid = params.get("uid");
-      if (uid) setUserDocId(uid);
       setMessages(prev => [
         ...prev,
         { role: "assistant", content: "Fitbit connected successfully! I can now use your activity data to give more personalized recommendations." }
@@ -112,7 +179,6 @@ export default function Home() {
     const userText = input.trim();
     setInput("");
 
-    // Snapshot length before state update so msgIndex is stable
     const nextMsgIndex = messages.length + 1;
 
     setMessages(prev => [...prev, { role: "user", content: userText }]);
@@ -128,7 +194,11 @@ export default function Home() {
           history,
           city,
           show_chunks: showChunks,
-          ...(userDocId && { user_doc_id: userDocId }),
+          // ----------------------------------------------------------------
+          // LE8 data — swap SAMPLE_LE8_DATA for a real API call when
+          // integrating with mHealthy Hearts. See comment block above.
+          // ----------------------------------------------------------------
+          le8_data: SAMPLE_LE8_DATA,
         }),
       });
 
@@ -183,7 +253,7 @@ export default function Home() {
       {/* Header */}
       <div className="bg-white border-b px-6 py-4 flex items-center justify-between shadow-sm">
         <div>
-          <h1 className="text-lg font-semibold text-gray-800">Health Chatbot</h1>
+          <h1 className="text-lg font-semibold text-gray-800">mHealthy Hearts</h1>
         </div>
         <div className="flex items-center gap-3">
           <input
@@ -223,7 +293,6 @@ export default function Home() {
             className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
           >
             <div className="flex flex-col">
-              {/* Message bubble */}
               <div
                 className={`max-w-xl px-4 py-3 rounded-2xl text-sm leading-relaxed ${
                   msg.role === "user"
@@ -234,12 +303,10 @@ export default function Home() {
                 <MessageContent content={msg.content} isUser={msg.role === "user"} />
               </div>
 
-              {/* Animation cards — rendered below bubble, outside it */}
               {msg.role === "assistant" && (
                 <AnimationCards animations={animationsByMessage[i]} />
               )}
 
-              {/* RAG debug panel */}
               {msg.role === "assistant" && chunksByMessage[i] && (
                 <div className="mt-1 max-w-xl">
                   <button
@@ -252,7 +319,6 @@ export default function Home() {
                   </button>
                   {expandedChunks[i] && (
                     <div className="mt-2 space-y-2">
-                      {/* Summary row */}
                       <div className="bg-gray-100 border border-gray-300 rounded-lg p-3 text-xs text-gray-600 space-y-1">
                         <p>
                           <span className="font-semibold">RAG query:</span>{" "}
@@ -293,7 +359,6 @@ export default function Home() {
                           </details>
                         )}
                       </div>
-                      {/* Individual chunks */}
                       {chunksByMessage[i].chunks.map((chunk, ci) => {
                         const used = chunk.used_in_context;
                         return (
@@ -363,7 +428,7 @@ export default function Home() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Ask about exercise, goals, or your health..."
+          placeholder="Ask about your heart health scores, goals, or lifestyle..."
           disabled={loading}
         />
         <button

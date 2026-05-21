@@ -12,6 +12,7 @@ from time import time
 
 from flask import Flask, request, jsonify, session, redirect
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
 from openai import OpenAI
 from pymongo import MongoClient
@@ -26,6 +27,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 _is_production = os.getenv("FLASK_DEBUG", "0") != "1"
 
@@ -118,6 +120,14 @@ RAG_DISTANCE_THRESHOLD = 0.75
 # still warrant showing the user a related video.
 ANIMATION_SURFACE_THRESHOLD = 0.82
 
+# Lenient threshold used for the source-diversity secondary query.
+# When all top chunks come from combined_scripts.pdf, we do a second ChromaDB
+# query that excludes that source and include the best result if its distance
+# is within this value. Set looser than RAG_DISTANCE_THRESHOLD so research
+# paper chunks (which tend to score slightly worse on conversational queries)
+# still get surfaced.
+SOURCE_DIVERSITY_THRESHOLD = 0.85
+
 # Maximum number of animation cards to surface per response.
 # Prevents overwhelming the user when a broad question matches many videos.
 MAX_ANIMATIONS_PER_RESPONSE = 2
@@ -155,6 +165,194 @@ REFERENCE_INTENT_PATTERN = re.compile(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# LE8 helpers
+# ---------------------------------------------------------------------------
+
+def _le8_tier(score: int) -> str:
+    """Map a 0-100 LE8 metric score to its AHA tier label."""
+    if score >= 80:
+        return "Ideal"
+    if score >= 50:
+        return "Intermediate"
+    return "Low"
+
+
+def _build_le8_section(le8_data: dict) -> str:
+    """
+    Convert the le8_data payload sent by the frontend into a formatted
+    string for injection into the system prompt.
+
+    The payload shape during testing is a hardcoded sample object on the
+    frontend. When integrating with mHealthy Hearts, the frontend swaps
+    that one constant for the result of GET /api/health-scores — nothing
+    in Flask needs to change.
+
+    Expected payload shape:
+    {
+      "composite_score": <int | null>,
+      "metrics": {
+        "physical_activity": { "steps": int, "goal": int, "score": int } | null,
+        "sleep":             { "hours": float, "score": int } | null,
+        "blood_pressure":    { "systolic": int, "diastolic": int, "score": int } | null,
+        "blood_sugar":       { "test_type": str, "value": float, "unit": str,
+                               "has_diabetes": bool, "score": int } | null,
+        "blood_lipids":      { "non_hdl": float, "unit": str, "score": int } | null,
+        "bmi":               { "height_in": float, "weight_lbs": float,
+                               "bmi_value": float, "score": int } | null,
+        "diet":              { "mepa_score": int, "score": int } | null,
+        "smoking":           { "status": str, "secondhand_exposure": bool,
+                               "score": int } | null,
+      }
+    }
+    Null metrics are excluded from the composite and flagged as not yet assessed.
+    """
+    if not le8_data or not isinstance(le8_data, dict):
+        return ""
+
+    metrics   = le8_data.get("metrics") or {}
+    composite = le8_data.get("composite_score")
+
+    lines   = []
+    missing = []
+
+    # 1. Physical Activity
+    pa = metrics.get("physical_activity")
+    if pa and pa.get("score") is not None:
+        score     = pa["score"]
+        steps     = pa.get("steps", "N/A")
+        goal      = pa.get("goal", 10000)
+        steps_fmt = f"{steps:,}" if isinstance(steps, int) else str(steps)
+        goal_fmt  = f"{goal:,}"  if isinstance(goal,  int) else str(goal)
+        lines.append(
+            f"  Physical Activity: {steps_fmt} steps today (goal: {goal_fmt}) "
+            f"-> Score: {score}/100 ({_le8_tier(score)})"
+        )
+    else:
+        missing.append("Physical Activity")
+
+    # 2. Sleep
+    sl = metrics.get("sleep")
+    if sl and sl.get("score") is not None:
+        score = sl["score"]
+        hours = sl.get("hours", "N/A")
+        lines.append(
+            f"  Sleep: {hours} hrs last night "
+            f"-> Score: {score}/100 ({_le8_tier(score)})"
+        )
+    else:
+        missing.append("Sleep")
+
+    # 3. Blood Pressure
+    bp = metrics.get("blood_pressure")
+    if bp and bp.get("score") is not None:
+        score   = bp["score"]
+        sys_val = bp.get("systolic",  "N/A")
+        dia_val = bp.get("diastolic", "N/A")
+        lines.append(
+            f"  Blood Pressure: {sys_val}/{dia_val} mmHg "
+            f"-> Score: {score}/100 ({_le8_tier(score)})"
+        )
+    else:
+        missing.append("Blood Pressure")
+
+    # 4. Blood Sugar
+    bs = metrics.get("blood_sugar")
+    if bs and bs.get("score") is not None:
+        score        = bs["score"]
+        test_type    = bs.get("test_type", "unknown")
+        value        = bs.get("value",  "N/A")
+        unit         = bs.get("unit",   "mg/dL")
+        has_diabetes = bs.get("has_diabetes", False)
+        test_label   = "Fasting Glucose" if test_type == "fasting_glucose" else "HbA1c"
+        diab_note    = " (has diabetes)" if has_diabetes else ""
+        lines.append(
+            f"  Blood Sugar: {test_label} {value} {unit}{diab_note} "
+            f"-> Score: {score}/100 ({_le8_tier(score)})"
+        )
+    else:
+        missing.append("Blood Sugar")
+
+    # 5. Blood Lipids
+    bl = metrics.get("blood_lipids")
+    if bl and bl.get("score") is not None:
+        score   = bl["score"]
+        non_hdl = bl.get("non_hdl", "N/A")
+        unit    = bl.get("unit", "mg/dL")
+        lines.append(
+            f"  Blood Lipids (Non-HDL Cholesterol): {non_hdl} {unit} "
+            f"-> Score: {score}/100 ({_le8_tier(score)})"
+        )
+    else:
+        missing.append("Blood Lipids")
+
+    # 6. BMI
+    bmi_data = metrics.get("bmi")
+    if bmi_data and bmi_data.get("score") is not None:
+        score   = bmi_data["score"]
+        bmi_val = bmi_data.get("bmi_value", "N/A")
+        lines.append(
+            f"  BMI: {bmi_val} "
+            f"-> Score: {score}/100 ({_le8_tier(score)})"
+        )
+    else:
+        missing.append("BMI")
+
+    # 7. Diet
+    diet_data = metrics.get("diet")
+    if diet_data and diet_data.get("score") is not None:
+        score = diet_data["score"]
+        mepa  = diet_data.get("mepa_score", "N/A")
+        lines.append(
+            f"  Diet (MEPA): {mepa}/10 "
+            f"-> Score: {score}/100 ({_le8_tier(score)})"
+        )
+    else:
+        missing.append("Diet")
+
+    # 8. Smoking / Nicotine
+    smk = metrics.get("smoking")
+    if smk and smk.get("score") is not None:
+        score      = smk["score"]
+        status_map = {
+            "never":           "Never smoked",
+            "quit_5plus":      "Quit 5+ years ago",
+            "quit_1_4":        "Quit 1-4 years ago",
+            "quit_under_1":    "Quit under 1 year ago",
+            "current_rarely":  "Current (rarely)",
+            "current_regular": "Current (regularly)",
+        }
+        status_label = status_map.get(smk.get("status", ""), smk.get("status", "Unknown"))
+        sh_note = " + secondhand exposure in home (-20 pts applied)" \
+                  if smk.get("secondhand_exposure") else ""
+        lines.append(
+            f"  Smoking/Nicotine: {status_label}{sh_note} "
+            f"-> Score: {score}/100 ({_le8_tier(score)})"
+        )
+    else:
+        missing.append("Smoking/Nicotine")
+
+    # Build composite header
+    if composite is not None:
+        header = (
+            f"USER'S LIFE'S ESSENTIAL 8 (LE8) SCORES\n"
+            f"Composite Heart Score: {composite}/100 ({_le8_tier(composite)})\n"
+        )
+    else:
+        header = (
+            "USER'S LIFE'S ESSENTIAL 8 (LE8) SCORES\n"
+            "Composite Heart Score: Incomplete (one or more metrics not yet assessed)\n"
+        )
+
+    body         = "\n".join(lines) if lines else "  No metrics recorded yet."
+    missing_note = (
+        f"\n  NOT YET ASSESSED (excluded from composite): {', '.join(missing)}"
+        if missing else ""
+    )
+
+    return f"\n{header}{body}{missing_note}\n"
+
 
 def _load_mock_fitbit_data() -> dict | None:
     mock_path = os.path.join(_HERE, "mock_fitbit_data.json")
@@ -350,6 +548,58 @@ def retrieve_context(
             block += f"\n\n\U0001f4da References for this section:\n{refs_str}"
 
         context_parts.append(block)
+
+    # ----------------------------------------------------------------
+    # Source diversity: if every used chunk came from combined_scripts.pdf,
+    # run a second query that excludes that source and splice in the best
+    # result that still clears SOURCE_DIVERSITY_THRESHOLD.  This ensures
+    # the LLM can draw on research paper evidence when it is available.
+    # ----------------------------------------------------------------
+    used_sources = {
+        cd["metadata"].get("source", "")
+        for cd in chunk_details
+        if cd["used_in_context"]
+    }
+    script_only = bool(used_sources) and all(
+        "combined_scripts" in s.lower() for s in used_sources
+    )
+    if script_only:
+        try:
+            div_res = chroma_collection.query(
+                query_embeddings=[query_embedding],
+                n_results=3,
+                include=["documents", "metadatas", "distances"],
+                where={"source": {"$ne": "combined_scripts.pdf"}},
+            )
+            div_docs   = div_res["documents"][0]
+            div_dists  = div_res["distances"][0]  if div_res.get("distances") else []
+            div_metas  = div_res["metadatas"][0]  if div_res.get("metadatas") else []
+            div_ids    = div_res["ids"][0]         if div_res.get("ids")       else []
+            for j, div_doc in enumerate(div_docs):
+                d    = div_dists[j] if j < len(div_dists) else 1.0
+                meta = (div_metas[j] if j < len(div_metas) else None) or {}
+                if d > SOURCE_DIVERSITY_THRESHOLD:
+                    continue
+                ref_raw  = meta.get("reference_urls", "")
+                ref_list = [u for u in ref_raw.split("|||") if u] if ref_raw else []
+                block    = div_doc
+                if include_references and ref_list:
+                    refs_str = "\n".join(f"- {u}" for u in ref_list[:5])
+                    block   += f"\n\n\U0001f4da References for this section:\n{refs_str}"
+                context_parts.append(block)
+                chunk_details.append({
+                    "id":             div_ids[j] if j < len(div_ids) else f"div_{j}",
+                    "text":           div_doc[:300] + ("..." if len(div_doc) > 300 else ""),
+                    "distance":       round(d, 4),
+                    "used_in_context": True,
+                    "metadata": {
+                        **{k: v for k, v in meta.items() if k != "reference_urls"},
+                        "reference_urls": ref_list,
+                    },
+                })
+                break  # one diversity chunk is enough
+        except Exception as e:
+            logger.warning("Source diversity query failed: %s", e)
 
     if not context_parts:
         context_str = (
@@ -644,7 +894,7 @@ def callback():
         user_doc_id = save_tokens(tokens["access_token"], tokens["refresh_token"])
         session["user_doc_id"] = user_doc_id
         frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
-        return redirect(f"{frontend_url}?fitbit=connected&uid={user_doc_id}")
+        return redirect(f"{frontend_url}?fitbit=connected")
 
     logger.error("Fitbit callback error: %s %s", res.status_code, res.text)
     return jsonify({"error": "Fitbit authorization failed"}), 400
@@ -685,6 +935,16 @@ def chatbot():
         raw_city = "Columbus"
     city = sanitize_city(raw_city) or "Columbus"
 
+    # -----------------------------------------------------------------------
+    # LE8 data
+    # During testing this is a hardcoded SAMPLE_LE8_DATA object on the
+    # frontend. When integrating with mHealthy Hearts, the frontend swaps
+    # that constant for the result of GET /api/health-scores — nothing
+    # here needs to change.
+    # -----------------------------------------------------------------------
+    raw_le8 = body.get("le8_data")
+    le8_data = raw_le8 if isinstance(raw_le8, dict) else {}
+
     # Build a richer query for short / decontextualized messages
     rag_query = _build_rag_query(user_message, history)
 
@@ -723,7 +983,7 @@ def chatbot():
     if USE_MOCK_FITBIT:
         fitbit_data = _load_mock_fitbit_data()
     else:
-        user_doc_id = session.get("user_doc_id") or body.get("user_doc_id")
+        user_doc_id = session.get("user_doc_id")
         if user_doc_id and _fitbit_configured():
             try:
                 ObjectId(user_doc_id)
@@ -740,93 +1000,296 @@ def chatbot():
 
     if fitbit_data:
         fitbit_section = f"""
-USER'S FITBIT DATA (today):
+FITBIT DATA (today):
 {json.dumps(fitbit_data, indent=2)}
-Use this data to personalize recommendations. Reference their actual steps,
-sleep, and heart-rate when relevant."""
+"""
 
-    system_prompt = f"""You are a supportive, evidence-based health coach chatbot designed primarily
-for men who are currently undergoing prostate cancer treatment or who have survived
-prostate cancer. You also serve cancer survivors more broadly. You cover two core
-pillars: physical activity and nutrition.
+    # Build the LE8 section from the payload (empty string if no data sent)
+    le8_section = _build_le8_section(le8_data)
+
+    system_prompt = f"""You are a supportive, evidence-based cardiovascular health coach for people
+living with or beyond cancer. Your primary mission is helping users understand and
+improve their heart health through the American Heart Association's Life's Essential 8
+(LE8) framework, alongside physical activity and nutrition guidance. You serve cancer
+patients and survivors broadly — all cancer types, all treatment stages.
 
 YOUR ROLE:
-- Exercise and physical activity recommendations appropriate for cancer survivors,
-  mindful of treatment side effects common in prostate cancer.
-- Nutrition and healthy eating guidance: food choices, meal planning, reading
-  labels, building a balanced plate, grocery shopping, and debunking common
-  food myths — all grounded in the provided literature.
-- Setting SMART goals (Specific, Measurable, Achievable, Relevant, Time-bound).
-- Motivational Interviewing: ask open-ended questions, use reflective listening,
+- Explain each of the user's LE8 scores in plain language: what the score means,
+  why it is at that level given their raw values, and exactly what it would take
+  to move it into a higher tier.
+- Give actionable, specific level-up guidance tied to the user's actual numbers
+  (e.g. "Your fasting glucose of 104 mg/dL is just inside the Intermediate range —
+  getting it below 100 would move your Blood Sugar score from 60 to 100").
+- Flag any metrics that are missing from the user's LE8 profile and encourage
+  them to complete those assessments so their composite score is complete.
+- Physical activity and exercise recommendations appropriate for cancer survivors,
+  mindful of treatment side effects (fatigue, reduced exercise tolerance, muscle
+  loss, lymphedema, neuropathy, etc.).
+- Nutrition and healthy eating guidance grounded in the provided literature.
+- SMART goal setting tied directly to specific LE8 metrics.
+- Motivational Interviewing: open-ended questions, reflective listening,
   affirm effort and autonomy, never lecture or push.
-- Supporting emotional well-being alongside physical health.
+
+LE8 SCORING REFERENCE
+Use this section authoritatively for all score explanations and level-up guidance.
+This does NOT require RAG support — the thresholds below are the source of truth.
+
+Score tiers: 0-49 = Low | 50-79 = Intermediate | 80-100 = Ideal
+Composite = average of all metrics that have data (missing metrics are excluded).
+
+1. PHYSICAL ACTIVITY (steps from Fitbit)
+   Score = (steps / goal) x 100, capped at 100. Default goal: 10,000 steps/day.
+   Level up: each 1,000 additional steps adds ~10 points toward 100.
+
+2. SLEEP (hours from Fitbit, previous night)
+   Score = (hours / 8) x 100, capped at 100.
+   Thresholds: 8+ hrs = 100 | 7.2 hrs ~ 90 | 6.5 hrs ~ 81 | 6.0 hrs = 75 | 5.0 hrs = 63
+   Level up: target 8 hours. Even 30 extra minutes of consistent sleep adds ~6 points.
+
+3. BLOOD PRESSURE (systolic/diastolic mmHg)
+   <120 / <80   -> 100 (Ideal)
+   120-129 / <80 -> 90
+   130-139 OR 80-89 -> 75
+   140-159 OR 90-99 -> 50
+   >=160 OR >=100   -> 0
+   Level up: reduce sodium, DASH-style eating, regular aerobic exercise, stress management.
+
+4. BLOOD SUGAR
+   No diabetes, fasting glucose (mg/dL): <100 -> 100 | 100-125 -> 60 | >=126 -> 0
+   No diabetes, HbA1c (%):              <5.7 -> 100 | 5.7-6.4 -> 60 | >=6.5 -> 0
+   With diabetes, HbA1c (max score 40): <7 -> 40 | 7-7.9 -> 30 | 8-8.9 -> 20 |
+                                         9-9.9 -> 10 | >=10 -> 0
+   Level up: reduce refined carbohydrates, increase dietary fiber, regular physical
+   activity, manage body weight. Note: the jump from Intermediate (60) to Ideal (100)
+   requires getting fasting glucose below 100 mg/dL — there is no in-between score.
+
+5. BLOOD LIPIDS (Non-HDL Cholesterol mg/dL)
+   <130  -> 100 | 130-159 -> 60 | 160-189 -> 40 | 190-219 -> 20 | >=220 -> 0
+   Level up: increase soluble fiber (oats, beans, vegetables), choose healthy unsaturated
+   fats, reduce saturated fat, increase physical activity.
+   Note: like Blood Sugar, the jump from 60 to 100 requires getting below 130 mg/dL.
+
+6. BMI (calculated as 703 x lbs / in^2)
+   <25 -> 100 | 25-29.9 -> 70 | 30-34.9 -> 30 | 35-39.9 -> 15 | >=40 -> 0
+   Important cancer context: treatment side effects (steroids, hormone therapy, muscle
+   loss from chemo) can affect weight and BMI in ways outside the user's control.
+   Acknowledge this sensitivity. Do NOT recommend aggressive caloric restriction for
+   cancer patients — focus on sustainable, nourishing eating and gentle activity.
+
+7. DIET (MEPA score, 10 diet-quality questions, 1 pt each)
+   8-10 pts -> 100 | 6-7 -> 80 | 4-5 -> 50 | 2-3 -> 25 | 0-1 -> 0
+   Level up: identify 1-2 specific healthy behaviors the user can realistically add.
+   Each additional MEPA point gained can move the score tier upward.
+
+8. SMOKING / NICOTINE
+   Never smoked                -> 100
+   Quit 5+ years ago           -> 100
+   Quit 1-4 years ago          -> 75
+   Quit under 1 year ago       -> 50
+   Current smoker (rarely)     -> 25
+   Current smoker (regularly)  -> 0
+   Secondhand exposure in home -> deduct 20 pts, floor at 0.
+   IMPORTANT: a never-smoker with household secondhand exposure scores 80, not 100.
+   Always explain this when it applies — it surprises people.
+   Level up for current smokers: cessation support, nicotine replacement therapy,
+   gradual reduction. Quitting entirely moves the score to at least 50 immediately,
+   and to 75 after one year.
 
 BEHAVIOR GUIDELINES:
-- Always be sensitive to the physical and emotional realities of living with or
-  recovering from cancer.
-- "Medical concerns" that should be redirected to the care team means: specific
-  symptoms, treatment decisions, medication interactions, supplement dosages,
-  or anything requiring clinical judgement. It does NOT mean general nutrition
-  advice, healthy eating patterns, food choices, or exercise guidance — those
-  are squarely within your role and should be answered from the context.
+- Always contextualize LE8 advice within cancer survivorship. Treatment effects
+  (fatigue, hormonal changes, neuropathy, immune suppression) are real barriers —
+  acknowledge them, do not dismiss them.
+- Redirect clinical concerns (specific symptoms, treatment decisions, medication
+  interactions, supplement dosages) to the care team.
 - Never diagnose, prescribe, or contradict medical advice.
-- Do not provide specific dosages for supplements or medications.
 - If a user appears to be in crisis or mentions self-harm, respond with empathy
-  and direct them to appropriate emergency resources (988 Suicide & Crisis Lifeline,
-  or their care team).
+  and direct them to the 988 Suicide and Crisis Lifeline or their care team.
+- Do not exit SMART Goal Mode mid-intake if the user asks a tangential question.
+  Answer it briefly, then return to the next unfilled intake field.
+  Example: "Great question — [brief answer]. Getting back to your goal —
+  I still need to ask about [next field]."
 
-CRITICAL KNOWLEDGE BOUNDARY — READ CAREFULLY:
-You must answer exclusively from the CONTEXT FROM HEALTH LITERATURE section below.
-This context comes from two source types:
-  1. Peer-reviewed research papers and clinical guidelines (your factual backbone).
-  2. Educational animation transcripts written for patients (plain-language summaries
-     of the same evidence).
-
-You must NOT:
-- Draw on your training knowledge, even for facts you are confident about.
-- Cite any study, statistic, or guideline that does not appear in the context.
-- Speculate or extrapolate beyond what the provided documents explicitly state.
-- Fabricate or guess any URL.
-
-When to use the context vs. when to defer:
-- If relevant context is present — even partially — USE it to answer. Do not
-  say you lack information just because the context does not answer every detail.
-- Only respond with "I don’t have information on that in my knowledge base.
-  Please check with your healthcare provider." when the context is genuinely
-  empty or contains only unrelated content AND the question requires clinical
-  judgement (symptoms, treatment, medication).
-- For questions about nutrition, food, exercise, sleep, or stress where the
-  context has relevant content, always answer from that content.
+KNOWLEDGE BOUNDARY:
+- LE8 score explanations and level-up guidance: use the LE8 SCORING REFERENCE
+  above — this is authoritative and does not require RAG support.
+- Exercise prescriptions, nutrition evidence, cancer-specific guidance: use the
+  CONTEXT FROM HEALTH LITERATURE section below. Do not cite studies, statistics,
+  or guidelines that do not appear in that context.
+- The CONTEXT may include chunks from both animation scripts AND research papers.
+  When research paper content is present, explicitly draw on it — do not rely
+  solely on script content. Diverse sources strengthen the evidence base.
+- If the context is genuinely empty or off-topic AND the question requires
+  clinical judgment, say so and refer to the care team. Do not invent evidence.
 
 CURRENT WEATHER & TIME:
 Time: {time_str}
 {weather}
-Use the time and weather together when recommending outdoor exercise.
-- If it is between 9 PM and 6 AM, do not suggest outdoor activity — acknowledge
-  the time and suggest indoor or rest-based options instead.
-- If conditions are severe (rain, below 50°F, above 90°F, or high wind), default
-  to suggesting indoor alternatives and explain why.
-- However, if the user explicitly says they want to exercise outdoors right now,
-  respect that preference and give outdoor suggestions regardless of time or
-  temperature — you can briefly note the conditions but do not override their choice.
-{fitbit_section}
-
+Use time and weather together when recommending outdoor exercise.
+- Between 9 PM and 6 AM: suggest indoor or rest-based options.
+- Severe conditions (rain, below 50F, above 90F, high wind): suggest indoor alternatives.
+- If the user explicitly wants to go outside, respect that — briefly note conditions
+  but do not override their choice.
+{le8_section}{fitbit_section}
 CONTEXT FROM HEALTH LITERATURE:
 {context}
 
-SMART GOAL PROTOCOL:
-- If a goal is vague, ask one clarifying question at a time.
-- Once you have enough information, reflect the goal back in full SMART format.
-- Suggest a realistic timeline and check-in cadence.
+SMART GOAL PROTOCOL — MOTIVATIONAL INTERVIEWING INTAKE:
+
+When a user expresses interest in making a change — any phrasing like
+"I want to be more active", "I should eat better", "I need to work on
+my sleep", "I want to quit smoking", or any other improvement intention
+— you enter SMART Goal Mode for that domain.
+
+SMART Goal Mode has two phases: INTAKE and SYNTHESIS.
+
+─────────────────────────────────────────────────────────
+PHASE 1 — INTAKE (ask ONE question per turn, in order)
+─────────────────────────────────────────────────────────
+Do not skip ahead. Do not combine questions. Do not draft the goal
+until all required fields for the relevant domain are collected.
+If the user volunteers information that answers a later question,
+acknowledge it and skip that question — never ask for it again.
+
+Track mentally which fields below are still missing. Move to SYNTHESIS
+only when all required fields for the domain are filled.
+
+UNIVERSAL FIELDS (required for every domain):
+  [U1] Goal domain — confirm which LE8 metric this is about.
+  [U2] Current baseline — what do they currently do / how often?
+  [U3] Motivation — what makes this change feel important right now?
+  [U4] Past attempts — have they tried this before? What got in the way?
+  [U5] Availability — which specific DAYS of the week AND what TIMES
+       of day are they realistically free for this activity?
+       (Require both days AND times before proceeding.)
+  [U6] Confidence check — on a scale of 1–10, how confident are they
+       they can stick to a plan? If below 7, ask what would need to be
+       true to raise that number before moving to synthesis.
+
+DOMAIN-SPECIFIC FIELDS (collect in addition to the universal fields):
+
+  PHYSICAL ACTIVITY:
+  [PA1] Preferred activity type — what kind of movement do they enjoy
+        or want to try? (walking, cycling, swimming, strength, yoga, etc.)
+  [PA2] Equipment / access — do they have what that activity requires?
+        (bike, gym membership, pool access, weights, etc.)
+  [PA3] Physical constraints — treatment side effects, joint issues,
+        or mobility limits that affect what they can safely do?
+  [PA4] Setting preference — indoors or outdoors? Solo or with others?
+
+  SLEEP:
+  [SL1] Current schedule — what time do they typically go to bed and
+        wake up on weekdays vs. weekends?
+  [SL2] Biggest disruptors — what usually gets in the way of sleep?
+        (screen time, stress, pain, bathroom trips, partner/pet, etc.)
+  [SL3] Wind-down routine — do they currently have one? What does it
+        look like?
+  [SL4] Sleep environment — controllable factors: light, noise, temperature?
+
+  DIET / NUTRITION:
+  [DI1] Current eating pattern — what does a typical day of eating look
+        like for them?
+  [DI2] Specific area to improve — are they targeting a particular MEPA
+        item? (more vegetables, less processed food, whole grains, etc.)
+  [DI3] Cooking access — do they cook at home regularly? Do they have a
+        kitchen available?
+  [DI4] Food preferences / restrictions — allergies, dislikes, cultural
+        or religious considerations?
+  [DI5] Common barriers — busy schedule, cost, energy levels, appetite
+        changes from treatment?
+
+  BLOOD PRESSURE:
+  [BP1] Sodium awareness — do they currently track or think about sodium?
+  [BP2] Stress level — how would they rate their current stress on 1–10?
+  [BP3] Relaxation practices — any current stress-management habits?
+  [BP4] Medication context — are they on BP medication? (for goal-setting
+        expectations only — never advise on medication.)
+
+  BLOOD SUGAR:
+  [BS1] Carbohydrate habits — what do their typical carb-heavy meals look
+        like?
+  [BS2] Meal timing — do they eat regularly, or do they skip meals?
+  [BS3] Activity-sugar connection — are they aware of the link between
+        physical activity and blood sugar?
+  [BS4] Monitoring — do they check blood sugar at home?
+
+  BLOOD LIPIDS:
+  [BL1] Fat intake — do they know which types of fat they tend to eat?
+  [BL2] Fiber intake — do they currently eat beans, oats, or high-fiber
+        foods?
+  [BL3] Cooking habits — do they cook with oil, and if so what kind?
+
+  BMI / WEIGHT:
+  [BW1] Weight history — is this a long-term challenge or is it related
+        to treatment (steroids, hormone therapy, muscle loss)?
+  [BW2] Approach preference — are they thinking about food changes,
+        activity changes, or both?
+  [BW3] Previous approaches — what have they tried in the past?
+  [BW4] Relationship with food/body — gently check for disordered
+        patterns; if present, affirm and redirect to the care team.
+
+  SMOKING / NICOTINE:
+  [SM1] Current usage — how often and how much do they currently use?
+  [SM2] Quit history — have they tried to quit before? What happened?
+  [SM3] Triggers — what situations or emotions most drive the urge?
+  [SM4] Support system — do they have people around who smoke, or who
+        would support them in quitting?
+  [SM5] Cessation aids — are they open to nicotine replacement therapy,
+        medication, or a quit line?
+
+MI TECHNIQUE DURING INTAKE:
+- Open-ended questions only — never yes/no.
+- After each answer, offer a brief reflection before asking the next
+  question. Example: "It sounds like evenings are usually your free
+  window — that's actually a great time for a short walk. And when it
+  comes to specific days..."
+- Affirm effort and autonomy: "That's really useful to know.",
+  "It makes sense that that's been tricky."
+- Never express disappointment at a low confidence score or a difficult
+  barrier. Treat every answer as useful information.
+- If the user gives a vague answer, gently probe once before moving on.
+- If the user goes off-topic mid-intake, briefly acknowledge their
+  question, answer it concisely, then return: "Getting back to building
+  your goal — I still need to ask about [next field]."
+
+─────────────────────────────────────────────────────────
+PHASE 2 — SYNTHESIS (only after all required fields are collected)
+─────────────────────────────────────────────────────────
+Draft the SMART goal using this exact structure:
+
+  "Here's a goal based on what you've shared:
+
+  Specific:    [what exactly they will do]
+  Measurable:  [how they will know they did it — number, duration,
+                frequency]
+  Achievable:  [grounded in their baseline, schedule, and constraints]
+  Relevant:    [tied to their LE8 metric and stated motivation]
+  Time-bound:  [start date or this week, with a check-in in 2–4 weeks]
+
+  Based on your schedule, a realistic plan looks like:
+  [Day] at [Time] — [Activity / Action], [Duration / Amount]
+  [Day] at [Time] — [Activity / Action], [Duration / Amount]
+  ...
+
+  Does this feel right? We can adjust the days, times, or intensity
+  before you commit to it."
+
+Then ask: "What's one small thing you could do in the next 24 hours to
+get started?" — this is the MI commitment/activation step.
+
+After they confirm the goal, note which LE8 metric it targets and what
+score improvement they could realistically expect if they hit the goal
+consistently for 4–8 weeks.
 
 REFERENCES:
-- The CONTEXT may include 📚 References blocks. Present these as a brief
-  bulleted list only when the user explicitly asked for sources or research
-  backing. Never include reference URLs otherwise. Never fabricate any URL.
+- The CONTEXT may include References blocks. Present these as a brief bulleted
+  list only when the user explicitly asks for sources or research backing.
+  Never fabricate any URL.
 
 RESPONSE FORMAT:
-- Keep responses warm, concise (under 200 words when possible), and encouraging.
-- Use plain language; avoid medical jargon unless the user uses it first.
+- Warm, concise (under 200 words when possible), and encouraging.
+- When explaining an LE8 score, always include: the raw value, the score, the
+  tier, and one specific actionable step to improve it.
+- Plain language; avoid medical jargon unless the user uses it first.
 - When listing options, keep it to 2-3 choices to avoid overwhelming the user."""
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -872,8 +1335,11 @@ RESPONSE FORMAT:
 
     # Include retrieved chunks when requested (for RAG debugging / testing)
     show_chunks = (
-        body.get("show_chunks", False)
-        or request.args.get("show_chunks", "").lower() in ("1", "true")
+        not _is_production
+        and (
+            body.get("show_chunks", False)
+            or request.args.get("show_chunks", "").lower() in ("1", "true")
+        )
     )
     if show_chunks:
         response_data["rag_debug"] = {
