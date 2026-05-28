@@ -61,6 +61,54 @@ function AnimationCards({ animations }) {
   );
 }
 
+function ExerciseVideoCards({ videos }) {
+  if (!videos || videos.length === 0) return null;
+  return (
+    <div className="mt-2 max-w-xl space-y-2">
+      {videos.map((v, i) => (
+        <div key={i} className="rounded-xl border border-green-200 bg-green-50 p-3">
+          <p className="text-[10px] font-semibold uppercase tracking-wider text-green-500 mb-1">
+            🏋️‍♂️ Exercise Video
+          </p>
+          <p className="text-sm font-semibold text-green-900 leading-snug mb-1">
+            {v.title}
+          </p>
+          <div className="flex flex-wrap gap-1 mb-2">
+            {v.category && (
+              <span className="text-[10px] bg-green-100 text-green-700 rounded-full px-2 py-0.5 font-medium">
+                {v.category}
+              </span>
+            )}
+            {v.difficulty && (
+              <span className="text-[10px] bg-green-100 text-green-700 rounded-full px-2 py-0.5 font-medium">
+                {v.difficulty}
+              </span>
+            )}
+            {v.duration_minutes && (
+              <span className="text-[10px] bg-green-100 text-green-700 rounded-full px-2 py-0.5 font-medium">
+                {v.duration_minutes} min
+              </span>
+            )}
+            {v.format && (
+              <span className="text-[10px] bg-green-100 text-green-700 rounded-full px-2 py-0.5 font-medium">
+                {v.format}
+              </span>
+            )}
+          </div>
+          <a
+            href={v.vimeo_link}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-sm font-semibold text-green-600 hover:text-green-800 underline underline-offset-2"
+          >
+            Watch on Vimeo →
+          </a>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // SAMPLE LE8 DATA
 //
@@ -147,6 +195,7 @@ export default function Home() {
   const [showChunks, setShowChunks] = useState(false);
   const [chunksByMessage, setChunksByMessage] = useState({});
   const [animationsByMessage, setAnimationsByMessage] = useState({});
+  const [exerciseVideosByMessage, setExerciseVideosByMessage] = useState({});
   const [expandedChunks, setExpandedChunks] = useState({});
 
   const bottomRef = useRef(null);
@@ -217,6 +266,10 @@ export default function Home() {
           setAnimationsByMessage(prev => ({ ...prev, [nextMsgIndex]: data.animations }));
         }
 
+        if (data.exercise_videos && data.exercise_videos.length > 0) {
+          setExerciseVideosByMessage(prev => ({ ...prev, [nextMsgIndex]: data.exercise_videos }));
+        }
+
         if (data.rag_debug) {
           setChunksByMessage(prev => ({ ...prev, [nextMsgIndex]: data.rag_debug }));
         }
@@ -261,6 +314,7 @@ export default function Home() {
             value={city}
             onChange={(e) => setCity(e.target.value)}
             placeholder="City for weather"
+            maxLength={100}
           />
           <button
             onClick={() => setShowChunks(prev => !prev)}
@@ -305,6 +359,10 @@ export default function Home() {
 
               {msg.role === "assistant" && (
                 <AnimationCards animations={animationsByMessage[i]} />
+              )}
+
+              {msg.role === "assistant" && (
+                <ExerciseVideoCards videos={exerciseVideosByMessage[i]} />
               )}
 
               {msg.role === "assistant" && chunksByMessage[i] && (

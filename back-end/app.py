@@ -14,12 +14,13 @@ from flask import Flask, request, jsonify, session, redirect
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 from pymongo import MongoClient
 from bson import ObjectId
 from bson.errors import InvalidId
 from urllib.parse import urlencode
 import chromadb
+import pandas as pd
 
 load_dotenv()
 
@@ -107,6 +108,8 @@ NWS_USER_AGENT = os.getenv("NWS_USER_AGENT", "(LifestyleAPI, contact@example.com
 USE_MOCK_FITBIT = os.getenv("USE_MOCK_FITBIT", "0") == "1"
 
 MAX_HISTORY_MESSAGES = 20       # ~20 turns is plenty; keeps token cost low
+MAX_HISTORY_STORED   = 100      # hard cap on messages accepted from client
+                                 # (prevents history-stuffing / DoS)
 MAX_MESSAGE_LENGTH = 2000
 CITY_PATTERN = re.compile(r"^[a-zA-Z\s\-'.]+$")
 
@@ -161,17 +164,383 @@ REFERENCE_INTENT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Exercise video library — loaded once at startup from Exercise Library.csv.
+#
+# Column name config: update EV_COL_* if the CSV uses different header names.
+# The loader does case-insensitive matching and partial matching as a fallback,
+# so minor naming variations ("Link" vs "Vimeo Link") are handled automatically.
+# ---------------------------------------------------------------------------
+_EXERCISE_CSV_PATH = os.path.join(_HERE, "Exercise Library.csv")
+EV_COL_CATEGORY   = "category"    # e.g. "Bodyweight", "Dumbbell", "Chair Yoga"
+EV_COL_DIFFICULTY = "difficulty"  # "Beginner", "Intermediate", "Advanced"
+EV_COL_TITLE      = "title"       # full video title; duration & format parsed from it
+EV_COL_LINK       = "link"        # Vimeo URL
+
+# Maximum exercise video cards surfaced per response
+MAX_EXERCISE_VIDEOS = 3
+
+# Detects when a user message is explicitly asking to see or do a workout/video.
+# Deliberately narrow: excludes generic health words like "active", "activity",
+# "training", "fitness" that appear constantly in LE8 conversations and would
+# cause exercise videos to surface on almost every message.
+EXERCISE_VIDEO_INTENT_PATTERN = re.compile(
+    r"\b(workout|workouts|work out|"
+    r"show me a workout|show me some exercises|"
+    r"do you have videos|exercise videos|what videos|"
+    r"what can i do at home|what exercises should i do|"
+    r"recommend.*workout|suggest.*workout|suggest.*exercise)\b",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Regex matching any character outside printable ASCII (used for prompt
+# sanitization below).
+_NON_PRINTABLE_ASCII = re.compile(r'[^\x20-\x7E]')
+
+
+def _sanitize_prompt_str(value, max_len: int = 80) -> str:
+    """
+    Sanitize an external string before embedding it in the system prompt.
+
+    Removes non-printable characters and newlines (which could break prompt
+    structure or inject new instructions), then truncates to max_len.
+    Safe for use on NWS weather fields, le8_data string fields, etc.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    # Collapse newlines / tabs into a single space
+    value = value.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    # Strip non-printable ASCII
+    value = _NON_PRINTABLE_ASCII.sub('', value)
+    return value[:max_len]
+
+
+def _safe_numeric(value, default: str = "N/A") -> str:
+    """
+    Return value formatted as a number string if it is genuinely numeric,
+    otherwise return default.  Prevents non-numeric frontend payloads from
+    being injected into the system prompt.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return default
+
+# ---------------------------------------------------------------------------
+# Exercise video helpers
+# ---------------------------------------------------------------------------
+
+def _parse_exercise_title(title: str) -> dict:
+    """
+    Extract duration_minutes, format (Seated/Standing/Mix), and body_part
+    from a video title string.
+
+    Titles follow the pattern:
+      "12 Minute Intermediate Bodyweight Lower Body Workout – With Rita (Bodyweight-Standing)"
+    """
+    # Duration: "12 Minute", "15-Minute", "30 Min"
+    dur_match = re.search(r"(\d+)\s*[-\s]?[Mm]in(?:ute)?", title)
+    duration_minutes = int(dur_match.group(1)) if dur_match else None
+
+    # Format: prefer the parenthetical at the end, e.g. "(Bodyweight-Standing)"
+    paren_match = re.search(r"\(([^)]+)\)", title)
+    search_text = paren_match.group(1).lower() if paren_match else title.lower()
+    if "seated" in search_text:
+        fmt = "Seated"
+    elif "standing" in search_text:
+        fmt = "Standing"
+    elif "mix" in search_text:
+        fmt = "Mix"
+    else:
+        fmt = None
+
+    # Body part
+    tl = title.lower()
+    if "full body" in tl or "full-body" in tl:
+        body_part = "Full Body"
+    elif "upper body" in tl or "upper-body" in tl:
+        body_part = "Upper Body"
+    elif "lower body" in tl or "lower-body" in tl:
+        body_part = "Lower Body"
+    elif "core" in tl:
+        body_part = "Core"
+    else:
+        body_part = None
+
+    return {"duration_minutes": duration_minutes, "format": fmt, "body_part": body_part}
+
+
+def _load_exercise_videos() -> list:
+    """
+    Load Exercise Library.csv at startup, parse title metadata, and drop any
+    rows that are missing a Vimeo link.  Returns a list of dicts, one per video.
+
+    Column discovery is case-insensitive and falls back to partial matching so
+    the loader is resilient to minor header-name variations in the CSV.
+    """
+    if not os.path.exists(_EXERCISE_CSV_PATH):
+        logger.warning(
+            "Exercise Library.csv not found at %s — exercise video matching disabled.",
+            _EXERCISE_CSV_PATH,
+        )
+        return []
+    try:
+        df = pd.read_csv(_EXERCISE_CSV_PATH)
+    except Exception as exc:
+        logger.error("Failed to read Exercise Library.csv: %s", exc)
+        return []
+
+    # Normalise headers to lowercase for flexible matching
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    # Map each configured column name → actual column in the DataFrame
+    col_map: dict = {}
+    for configured, attr in [
+        (EV_COL_CATEGORY,   "category"),
+        (EV_COL_DIFFICULTY, "difficulty"),
+        (EV_COL_TITLE,      "title"),
+        (EV_COL_LINK,       "link"),
+    ]:
+        cn = configured.lower()
+        if cn in df.columns:
+            col_map[attr] = cn
+        else:
+            # Partial match — handles "vimeo link" matching configured "link", etc.
+            matches = [c for c in df.columns if cn in c or c in cn]
+            if matches:
+                col_map[attr] = matches[0]
+            else:
+                logger.warning(
+                    "Exercise Library.csv: column '%s' not found. Available: %s",
+                    configured, list(df.columns),
+                )
+
+    if not {"category", "difficulty", "title", "link"}.issubset(col_map):
+        logger.error(
+            "Exercise Library.csv is missing required columns — check EV_COL_* constants. "
+            "Resolved mapping: %s", col_map,
+        )
+        return []
+
+    videos = []
+    for _, row in df.iterrows():
+        link = str(row[col_map["link"]]).strip()
+        if not link or link.lower() in ("nan", "none", "") or not link.startswith("https://"):
+            continue
+        title      = str(row[col_map["title"]]).strip()
+        category   = str(row[col_map["category"]]).strip()
+        difficulty = str(row[col_map["difficulty"]]).strip()
+        parsed     = _parse_exercise_title(title)
+        videos.append({
+            "category":         category,
+            "difficulty":       difficulty,
+            "title":            title,
+            "vimeo_link":       link,
+            "duration_minutes": parsed["duration_minutes"],
+            "format":           parsed["format"],
+            "body_part":        parsed["body_part"],
+        })
+
+    logger.info("Exercise Library loaded: %d videos with links.", len(videos))
+    return videos
+
+
+# Load once at startup — immutable after this point
+EXERCISE_VIDEOS: list = _load_exercise_videos()
+
+
+def _infer_difficulty_from_le8(le8_data: dict) -> str:
+    """
+    Map the user's LE8 Physical Activity score to an exercise difficulty level.
+    Falls back to Beginner when no score is available.
+    """
+    try:
+        pa_score = (
+            (le8_data or {}).get("metrics", {})
+                           .get("physical_activity", {})
+                           .get("score")
+        )
+        if pa_score is None:
+            return "Beginner"
+        if pa_score >= 70:
+            return "Advanced"
+        if pa_score >= 40:
+            return "Intermediate"
+        return "Beginner"
+    except Exception:
+        return "Beginner"
+
+
+def _detect_exercise_filters(history: list) -> dict:
+    """
+    Scan the full conversation history for answers to the four exercise
+    preference questions [EV1]–[EV4] and return a structured filters dict.
+
+    Empty lists / None values mean that question hasn't been answered yet.
+    Only the most recent MAX_HISTORY_STORED messages are scanned to prevent
+    stale preferences from old conversations bleeding in.
+    """
+    filters: dict = {
+        "categories":  [],
+        "format":      [],
+        "duration_min": None,
+        "duration_max": None,
+        "exclusions":  [],
+    }
+
+    # Cap scan to recent history to avoid stale-preference pollution
+    user_text = " ".join(
+        msg["content"].lower()
+        for msg in history[-MAX_HISTORY_STORED:]
+        if isinstance(msg, dict) and msg.get("role") == "user"
+    ).strip()
+
+    if not user_text:
+        return filters
+
+    # ── [EV1] Workout category ───────────────────────────────────────────────
+    # Order matters: "chair yoga" must be checked before plain "yoga" so we
+    # don't add both tags when the user says "chair yoga".
+    category_keywords = [
+        ("chair yoga",       "Chair Yoga"),
+        ("tai chi",          "Tai Chi"),
+        ("resistance band",  "Resistance Bands"),
+        ("resistance bands", "Resistance Bands"),
+        ("dumbbell",         "Dumbbell"),
+        ("dumbbells",        "Dumbbell"),
+        ("hand weight",      "Dumbbell"),
+        ("bodyweight",       "Bodyweight"),
+        ("body weight",      "Bodyweight"),
+        ("yoga",             "Yoga"),
+    ]
+    seen_cats: set = set()
+    for kw, cat in category_keywords:
+        if kw in user_text and cat not in seen_cats:
+            # Don't add plain "Yoga" if "Chair Yoga" is already captured
+            if cat == "Yoga" and "Chair Yoga" in seen_cats:
+                continue
+            filters["categories"].append(cat)
+            seen_cats.add(cat)
+
+    # ── [EV2] Format (seated / standing / mix) ───────────────────────────────
+    has_seated   = bool(re.search(r"\bseated\b", user_text))
+    has_standing = bool(re.search(r"\bstanding\b", user_text))
+    # Use "mix" / "mixed" only — "both" is too common a word to be a reliable signal
+    has_mix      = bool(re.search(r"\bmix\b|\bmixed\b", user_text))
+
+    if has_seated and not has_standing:
+        filters["format"].append("Seated")
+    if has_standing and not has_seated:
+        filters["format"].append("Standing")
+    if has_mix or (has_seated and has_standing):
+        if "Mix" not in filters["format"]:
+            filters["format"].append("Mix")
+
+    # ── [EV3] Duration ───────────────────────────────────────────────────────
+    # Match explicit duration ranges only — do NOT match standalone "10 min"
+    # because "I walk 10 minutes a day" is a very common health context phrase
+    # that has nothing to do with answering EV3.
+    if re.search(r"10\s*[-–to]+\s*15", user_text):
+        filters["duration_min"], filters["duration_max"] = 10, 15
+    elif re.search(r"15\s*[-–to]+\s*20", user_text):
+        filters["duration_min"], filters["duration_max"] = 15, 20
+    elif re.search(r"25\s*[-–to]+\s*30", user_text):
+        filters["duration_min"], filters["duration_max"] = 25, 30
+    elif re.search(r"30\s*\+|over\s+30|more\s+than\s+30|longer\s+than\s+30", user_text):
+        filters["duration_min"], filters["duration_max"] = 30, 999
+
+    # ── [EV4] Movement exclusions ────────────────────────────────────────────
+    if re.search(r"\bbalanc", user_text):
+        filters["exclusions"].append("balance")
+    # Use \bjumping\b instead of \bjump to avoid matching "jump in",
+    # "jump start", "jump from X to Y" which are common conversational phrases.
+    if re.search(r"\bjumping\b", user_text):
+        filters["exclusions"].append("jump")
+    if re.search(r"\bkneel", user_text):
+        filters["exclusions"].append("kneel")
+
+    return filters
+
+
+def _match_exercise_videos(filters: dict, difficulty: str) -> list:
+    """
+    Match EXERCISE_VIDEOS against the user's preferences using AND logic with
+    progressive fallback.  Hard movement exclusions (balance/jump/kneel) are
+    always enforced regardless of fallback level.
+
+    Fallback order (most specific → least specific):
+      0. category + difficulty + duration + format
+      1. category + difficulty + duration
+      2. category + difficulty
+      3. category only
+      4. any eligible video (exclusions still applied)
+
+    Returns up to MAX_EXERCISE_VIDEOS matches.
+    """
+    if not EXERCISE_VIDEOS:
+        return []
+
+    categories_lower  = [c.lower() for c in (filters.get("categories") or [])]
+
+    # Don't surface videos until the user has answered at least [EV1] (category
+    # preference).  Without categories we'd fall through to level-4 fallback and
+    # return arbitrary videos with no relevance to what the user wants.
+    if not categories_lower:
+        return []
+    format_lower      = [f.lower() for f in (filters.get("format")      or [])]
+    dur_min           = filters.get("duration_min")
+    dur_max           = filters.get("duration_max")
+    exclusions        = filters.get("exclusions") or []
+    difficulty_lower  = (difficulty or "").lower()
+
+    def passes_exclusions(v: dict) -> bool:
+        """Hard exclusions — never relaxed."""
+        tl = v["title"].lower()
+        if "balance" in exclusions and re.search(r"\bbalanc|single.?leg", tl):
+            return False
+        if "jump" in exclusions and re.search(r"\bjump|\bhop|\bplyometric", tl):
+            return False
+        if "kneel" in exclusions and re.search(r"\bkneel", tl):
+            return False
+        return True
+
+    def cat_ok(v):  return not categories_lower  or v["category"].lower() in categories_lower
+    def diff_ok(v): return not difficulty_lower   or v["difficulty"].lower() == difficulty_lower
+    def dur_ok(v):
+        if dur_min is None or dur_max is None:
+            return True
+        d = v.get("duration_minutes")
+        return d is None or (dur_min <= d <= dur_max)
+    def fmt_ok(v):
+        if not format_lower:
+            return True
+        fmt = (v.get("format") or "").lower()
+        return not fmt or fmt in format_lower or "mix" in format_lower
+
+    eligible = [v for v in EXERCISE_VIDEOS if passes_exclusions(v)]
+
+    for level in range(5):
+        if   level == 0: results = [v for v in eligible if cat_ok(v) and diff_ok(v) and dur_ok(v) and fmt_ok(v)]
+        elif level == 1: results = [v for v in eligible if cat_ok(v) and diff_ok(v) and dur_ok(v)]
+        elif level == 2: results = [v for v in eligible if cat_ok(v) and diff_ok(v)]
+        elif level == 3: results = [v for v in eligible if cat_ok(v)]
+        else:            results = eligible
+        if results:
+            return results[:MAX_EXERCISE_VIDEOS]
+
+    return []
+
+
 # ---------------------------------------------------------------------------
 # LE8 helpers
 # ---------------------------------------------------------------------------
 
-def _le8_tier(score: int) -> str:
-    """Map a 0-100 LE8 metric score to its AHA tier label."""
+def _le8_tier(score) -> str:
+    """Map a 0-100 LE8 metric score (int or float) to its AHA tier label."""
     if score >= 80:
         return "Ideal"
     if score >= 50:
@@ -262,8 +631,8 @@ def _build_le8_section(le8_data: dict) -> str:
     if bs and bs.get("score") is not None:
         score        = bs["score"]
         test_type    = bs.get("test_type", "unknown")
-        value        = bs.get("value",  "N/A")
-        unit         = bs.get("unit",   "mg/dL")
+        value        = _safe_numeric(bs.get("value"))
+        unit         = _sanitize_prompt_str(bs.get("unit", "mg/dL"), 20)
         has_diabetes = bs.get("has_diabetes", False)
         test_label   = "Fasting Glucose" if test_type == "fasting_glucose" else "HbA1c"
         diab_note    = " (has diabetes)" if has_diabetes else ""
@@ -278,8 +647,8 @@ def _build_le8_section(le8_data: dict) -> str:
     bl = metrics.get("blood_lipids")
     if bl and bl.get("score") is not None:
         score   = bl["score"]
-        non_hdl = bl.get("non_hdl", "N/A")
-        unit    = bl.get("unit", "mg/dL")
+        non_hdl = _safe_numeric(bl.get("non_hdl"))
+        unit    = _sanitize_prompt_str(bl.get("unit", "mg/dL"), 20)
         lines.append(
             f"  Blood Lipids (Non-HDL Cholesterol): {non_hdl} {unit} "
             f"-> Score: {score}/100 ({_le8_tier(score)})"
@@ -323,7 +692,8 @@ def _build_le8_section(le8_data: dict) -> str:
             "current_rarely":  "Current (rarely)",
             "current_regular": "Current (regularly)",
         }
-        status_label = status_map.get(smk.get("status", ""), smk.get("status", "Unknown"))
+        raw_status   = _sanitize_prompt_str(smk.get("status", ""), 30)
+        status_label = status_map.get(raw_status, "Unknown")
         sh_note = " + secondhand exposure in home (-20 pts applied)" \
                   if smk.get("secondhand_exposure") else ""
         lines.append(
@@ -378,6 +748,16 @@ def rate_limit(f):
         elif ip in rate_limit_store:
             del rate_limit_store[ip]
 
+        # Prune the store when it grows large to prevent unbounded memory use.
+        # Removes entries whose most recent timestamp is outside the window.
+        if len(rate_limit_store) > 10_000:
+            stale = [
+                k for k, v in rate_limit_store.items()
+                if not v or (now - max(v)) > RATE_LIMIT_WINDOW
+            ]
+            for k in stale:
+                del rate_limit_store[k]
+
         entry = rate_limit_store.get(ip, [])
         if len(entry) >= RATE_LIMIT_MAX:
             return jsonify({"error": "Too many requests. Please wait a moment."}), 429
@@ -397,7 +777,9 @@ def sanitize_city(city: str) -> str | None:
 
 def sanitize_history(history: list) -> list:
     clean = []
-    for msg in history:
+    # Hard cap on how many messages we'll accept from the client to prevent
+    # history-stuffing attacks and excessive memory use in filter detection.
+    for msg in history[-MAX_HISTORY_STORED:]:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
@@ -528,14 +910,21 @@ def retrieve_context(
         # ----------------------------------------------------------------
         anim_url = meta.get("animation_url", "")
         section_title = meta.get("section_title", "")
-        if (
+        # Only surface animation cards for URLs that are genuine Vimeo links.
+        # This prevents malformed or injected metadata from producing bad hrefs.
+        anim_url_safe = (
             anim_url
-            and anim_url not in seen_anim_urls
+            if isinstance(anim_url, str) and anim_url.startswith("https://vimeo.com")
+            else ""
+        )
+        if (
+            anim_url_safe
+            and anim_url_safe not in seen_anim_urls
             and distance <= ANIMATION_SURFACE_THRESHOLD
             and len(animations) < MAX_ANIMATIONS_PER_RESPONSE
         ):
-            animations.append({"title": section_title, "url": anim_url})
-            seen_anim_urls.add(anim_url)
+            animations.append({"title": section_title, "url": anim_url_safe})
+            seen_anim_urls.add(anim_url_safe)
 
         if not use_chunk:
             continue
@@ -684,10 +1073,15 @@ def get_weather(city: str = "Columbus", city_info=None) -> str:
         forecast_res.raise_for_status()
         periods = forecast_res.json()["properties"]["periods"]
         current = periods[0]
+        temp      = _safe_numeric(current.get("temperature"), "N/A")
+        temp_unit = _sanitize_prompt_str(str(current.get("temperatureUnit", "F")), 5)
+        forecast  = _sanitize_prompt_str(str(current.get("shortForecast",   "")), 60)
+        wind_dir  = _sanitize_prompt_str(str(current.get("windDirection",    "")), 20)
+        wind_spd  = _sanitize_prompt_str(str(current.get("windSpeed",        "")), 20)
         return (
-            f"{city}: {current['temperature']}°{current['temperatureUnit']}, "
-            f"{current['shortForecast']}, "
-            f"wind {current['windDirection']} {current['windSpeed']}"
+            f"{city}: {temp}°{temp_unit}, "
+            f"{forecast}, "
+            f"wind {wind_dir} {wind_spd}"
         )
     except Exception as e:
         logger.warning("NWS forecast fetch failed: %s", e)
@@ -782,7 +1176,7 @@ def refresh_access_token(refresh_token: str, user_doc_id: str | None = None):
             save_tokens(token_data["access_token"], token_data["refresh_token"], user_doc_id)
         return token_data
 
-    logger.error("Token refresh failed: %s %s", res.status_code, res.text)
+    logger.error("Token refresh failed: %s (response body suppressed)", res.status_code)
     return None
 
 
@@ -1285,6 +1679,48 @@ REFERENCES:
   list only when the user explicitly asks for sources or research backing.
   Never fabricate any URL.
 
+EXERCISE VIDEO PROTOCOL:
+
+The system has a curated library of exercise videos (bodyweight, dumbbell,
+chair yoga, tai chi) that are surfaced as cards automatically alongside your
+response — you do NOT need to list URLs or embed links yourself.
+
+WHEN TO ASK THE PREFERENCE QUESTIONS:
+1. During PA SMART Goal intake: after completing [PA1]–[PA4], ask [EV1]–[EV4]
+   in order before moving to PHASE 2 SYNTHESIS.
+2. Whenever the user asks about exercises, workouts, or videos — e.g.
+   "what exercises should I do?", "show me a workout", "do you have videos?",
+   "what can I do at home?".
+
+THE 4 PREFERENCE QUESTIONS — ask exactly one per turn in this order:
+
+  [EV1] "What kinds of workouts do you enjoy or want to try? You can choose
+         as many as you like: bodyweight, dumbbells, resistance bands, yoga,
+         chair yoga, or tai chi."
+
+  [EV2] "Do you prefer workouts that are all seated, all standing, or
+         a mix of both?"
+
+  [EV3] "How long would you like your workouts to be?
+         Options: 10–15 min, 15–20 min, 25–30 min, or 30+ min."
+
+  [EV4] "Are any of these movements difficult or uncomfortable for you —
+         balancing, jumping, or kneeling? Say 'none' if none apply."
+
+MI STYLE: one question per turn, brief warm reflection after each answer,
+affirm their preferences, never pressure toward a specific choice.
+
+AFTER COLLECTING ANSWERS:
+- Tell the user the system is finding matching videos for them.
+- Do NOT list, guess, or fabricate any video URLs yourself.
+- The video cards will surface automatically alongside this response.
+- If physical limitations were mentioned, briefly acknowledge them
+  before transitioning: "Great — I'll make sure to filter out anything
+  that involves [limitation] for you."
+
+IF ASKED ABOUT EXERCISES WITHOUT ANY PRIOR PREFERENCES:
+- Ask [EV1] first. Collect [EV1]–[EV4] before surfacing recommendations.
+
 RESPONSE FORMAT:
 - Warm, concise (under 200 words when possible), and encouraging.
 - When explaining an LE8 score, always include: the raw value, the score, the
@@ -1308,7 +1744,6 @@ RESPONSE FORMAT:
     except Exception as e:
         # If gpt-4o-mini is rate-limited (429), fall back to gpt-3.5-turbo
         # which has a separate daily quota bucket.
-        from openai import RateLimitError
         if isinstance(e, RateLimitError):
             logger.warning("gpt-4o-mini rate limited, falling back to gpt-3.5-turbo: %s", e)
             try:
@@ -1331,7 +1766,26 @@ RESPONSE FORMAT:
         {"role": "assistant", "content": reply},
     ]
 
-    response_data = {"reply": reply, "history": updated_history, "animations": animations}
+    # ---------------------------------------------------------------------------
+    # Exercise video matching
+    # Run after the LLM call so the updated history (including this turn's user
+    # message) is passed to filter detection.  Matching only fires when the user
+    # shows exercise intent OR has already answered at least EV1 + EV3 (category
+    # + duration), so videos don't surface on every unrelated message.
+    # ---------------------------------------------------------------------------
+    exercise_filters   = _detect_exercise_filters(updated_history)
+    exercise_difficulty = _infer_difficulty_from_le8(le8_data)
+    exercise_intent    = bool(EXERCISE_VIDEO_INTENT_PATTERN.search(user_message))
+    min_filters_set    = (
+        bool(exercise_filters.get("categories"))
+        and exercise_filters.get("duration_min") is not None
+    )
+    if exercise_intent or min_filters_set:
+        exercise_videos = _match_exercise_videos(exercise_filters, exercise_difficulty)
+    else:
+        exercise_videos = []
+
+    response_data = {"reply": reply, "history": updated_history, "animations": animations, "exercise_videos": exercise_videos}
 
     # Include retrieved chunks when requested (for RAG debugging / testing)
     show_chunks = (
