@@ -195,7 +195,11 @@ export default function Home() {
   const [showChunks, setShowChunks] = useState(false);
   const [chunksByMessage, setChunksByMessage] = useState({});
   const [animationsByMessage, setAnimationsByMessage] = useState({});
-  const [exerciseVideosByMessage, setExerciseVideosByMessage] = useState({});
+  // Exercise videos: track only the most recent set returned by the backend.
+  // Cleared at the start of every new sendMessage call so they never persist
+  // across unrelated follow-up messages.
+  const [latestExerciseVideos, setLatestExerciseVideos] = useState([]);
+  const [latestExerciseVideosMsgIdx, setLatestExerciseVideosMsgIdx] = useState(null);
   const [expandedChunks, setExpandedChunks] = useState({});
 
   const bottomRef = useRef(null);
@@ -229,6 +233,11 @@ export default function Home() {
     setInput("");
 
     const nextMsgIndex = messages.length + 1;
+
+    // Clear exercise videos immediately so they don't persist from the
+    // previous turn while the new response is loading.
+    setLatestExerciseVideos([]);
+    setLatestExerciseVideosMsgIdx(null);
 
     setMessages(prev => [...prev, { role: "user", content: userText }]);
     setLoading(true);
@@ -267,7 +276,8 @@ export default function Home() {
         }
 
         if (data.exercise_videos && data.exercise_videos.length > 0) {
-          setExerciseVideosByMessage(prev => ({ ...prev, [nextMsgIndex]: data.exercise_videos }));
+          setLatestExerciseVideos(data.exercise_videos);
+          setLatestExerciseVideosMsgIdx(nextMsgIndex);
         }
 
         if (data.rag_debug) {
@@ -361,8 +371,8 @@ export default function Home() {
                 <AnimationCards animations={animationsByMessage[i]} />
               )}
 
-              {msg.role === "assistant" && (
-                <ExerciseVideoCards videos={exerciseVideosByMessage[i]} />
+              {msg.role === "assistant" && i === latestExerciseVideosMsgIdx && (
+                <ExerciseVideoCards videos={latestExerciseVideos} />
               )}
 
               {msg.role === "assistant" && chunksByMessage[i] && (

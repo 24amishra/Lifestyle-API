@@ -274,13 +274,80 @@ def _parse_exercise_title(title: str) -> dict:
     return {"duration_minutes": duration_minutes, "format": fmt, "body_part": body_part}
 
 
+def _detect_column_roles(df: "pd.DataFrame") -> dict:
+    """
+    Identify category / difficulty / title / link columns by DATA VALUES,
+    not header names.  This is robust to any CSV export format.
+
+    Detection logic (each role claimed at most once, in this order):
+      link       — values mostly start with "http"
+      difficulty — values are mostly Beginner / Intermediate / Advanced
+      category   — values are mostly known workout-type strings
+      title      — the remaining column with the longest average string length
+
+    Falls back to EV_COL_* name-matching for any role still unresolved.
+    """
+    # Known content values for each role
+    _KNOWN_CATS  = {"bodyweight", "dumbbell", "chair yoga", "tai chi", "yoga", "resistance bands"}
+    _KNOWN_DIFFS = {"beginner", "intermediate", "advanced"}
+
+    col_map: dict = {}
+
+    for col in df.columns:
+        if len(col_map) >= 4:
+            break
+        vals = df[col].dropna().astype(str)
+        if vals.empty:
+            continue
+        vals_lower = vals.str.strip().str.lower()
+
+        if "link" not in col_map and vals.str.startswith("http").mean() > 0.3:
+            col_map["link"] = col
+
+        elif "difficulty" not in col_map and vals_lower.isin(_KNOWN_DIFFS).mean() > 0.3:
+            col_map["difficulty"] = col
+
+        elif "category" not in col_map and vals_lower.isin(_KNOWN_CATS).mean() > 0.3:
+            col_map["category"] = col
+
+    # Title: longest-average-value column not already claimed
+    if "title" not in col_map:
+        used      = set(col_map.values())
+        remaining = [c for c in df.columns if c not in used]
+        if remaining:
+            col_map["title"] = max(
+                remaining,
+                key=lambda c: df[c].dropna().astype(str).str.len().mean(),
+            )
+
+    # Fallback: name-based matching for any role still unmapped
+    for configured, attr in [
+        (EV_COL_CATEGORY,   "category"),
+        (EV_COL_DIFFICULTY, "difficulty"),
+        (EV_COL_TITLE,      "title"),
+        (EV_COL_LINK,       "link"),
+    ]:
+        if attr in col_map:
+            continue
+        cn = configured.lower()
+        if cn in df.columns:
+            col_map[attr] = cn
+        else:
+            matches = [c for c in df.columns if cn in c or c in cn]
+            if matches:
+                col_map[attr] = matches[0]
+
+    return col_map
+
+
 def _load_exercise_videos() -> list:
     """
     Load Exercise Library.csv at startup, parse title metadata, and drop any
     rows that are missing a Vimeo link.  Returns a list of dicts, one per video.
 
-    Column discovery is case-insensitive and falls back to partial matching so
-    the loader is resilient to minor header-name variations in the CSV.
+    Column roles are detected by DATA VALUES (not header names) via
+    _detect_column_roles(), so the loader works regardless of how the CSV
+    was exported or what the headers are called.
     """
     if not os.path.exists(_EXERCISE_CSV_PATH):
         logger.warning(
@@ -288,41 +355,34 @@ def _load_exercise_videos() -> list:
             _EXERCISE_CSV_PATH,
         )
         return []
-    try:
-        df = pd.read_csv(_EXERCISE_CSV_PATH)
-    except Exception as exc:
-        logger.error("Failed to read Exercise Library.csv: %s", exc)
+
+    # Excel on Windows exports CSV in cp1252 (Windows-1252) by default.
+    # Try UTF-8 first, fall back to cp1252, then latin-1 as a last resort.
+    df = None
+    for encoding in ("utf-8", "cp1252", "latin-1"):
+        try:
+            df = pd.read_csv(_EXERCISE_CSV_PATH, encoding=encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+        except Exception as exc:
+            logger.error("Failed to read Exercise Library.csv: %s", exc)
+            return []
+    if df is None:
+        logger.error("Exercise Library.csv: could not decode with utf-8, cp1252, or latin-1")
         return []
 
-    # Normalise headers to lowercase for flexible matching
+    # Normalise headers to lowercase for content scanning
     df.columns = [str(c).strip().lower() for c in df.columns]
+    logger.info("Exercise Library.csv columns detected: %s", list(df.columns))
 
-    # Map each configured column name → actual column in the DataFrame
-    col_map: dict = {}
-    for configured, attr in [
-        (EV_COL_CATEGORY,   "category"),
-        (EV_COL_DIFFICULTY, "difficulty"),
-        (EV_COL_TITLE,      "title"),
-        (EV_COL_LINK,       "link"),
-    ]:
-        cn = configured.lower()
-        if cn in df.columns:
-            col_map[attr] = cn
-        else:
-            # Partial match — handles "vimeo link" matching configured "link", etc.
-            matches = [c for c in df.columns if cn in c or c in cn]
-            if matches:
-                col_map[attr] = matches[0]
-            else:
-                logger.warning(
-                    "Exercise Library.csv: column '%s' not found. Available: %s",
-                    configured, list(df.columns),
-                )
+    col_map = _detect_column_roles(df)
+    logger.info("Exercise Library column mapping: %s", col_map)
 
     if not {"category", "difficulty", "title", "link"}.issubset(col_map):
         logger.error(
-            "Exercise Library.csv is missing required columns — check EV_COL_* constants. "
-            "Resolved mapping: %s", col_map,
+            "Exercise Library.csv: could not identify all required columns. "
+            "Resolved mapping so far: %s", col_map,
         )
         return []
 
@@ -345,12 +405,84 @@ def _load_exercise_videos() -> list:
             "body_part":        parsed["body_part"],
         })
 
+    if videos:
+        s = videos[0]
+        logger.info(
+            "Exercise Library sample — category: %r  difficulty: %r  "
+            "title: %r  link: %r",
+            s["category"], s["difficulty"],
+            s["title"][:60], s["vimeo_link"][:50],
+        )
     logger.info("Exercise Library loaded: %d videos with links.", len(videos))
     return videos
 
 
 # Load once at startup — immutable after this point
 EXERCISE_VIDEOS: list = _load_exercise_videos()
+
+
+def _compute_exercise_options() -> tuple:
+    """
+    Derive the list of available workout categories and duration brackets
+    directly from the loaded video library so the system prompt never offers
+    an option that has zero matching videos.
+
+    Returns (categories_str, durations_str) — both ready for injection into
+    the system prompt.
+    """
+    if not EXERCISE_VIDEOS:
+        # Sensible fallback when the CSV is missing or empty
+        return (
+            "bodyweight, dumbbells, resistance bands, yoga, chair yoga, or tai chi",
+            "10\u201315 min, 15\u201320 min, or 25\u201330 min",
+        )
+
+    # ── Categories ──────────────────────────────────────────────────────────
+    cats = sorted({v["category"] for v in EXERCISE_VIDEOS if v.get("category")})
+    if len(cats) > 1:
+        cats_str = ", ".join(cats[:-1]) + ", or " + cats[-1]
+    elif cats:
+        cats_str = cats[0]
+    else:
+        cats_str = "bodyweight, dumbbells, resistance bands, yoga, chair yoga, or tai chi"
+
+    # ── Duration brackets ─────────────────────────────────────────────────
+    # Each bracket label matches the regex used in _detect_exercise_filters.
+    bracket_defs = [
+        (0,  10, 15,  "10\u201315 min"),
+        (1,  15, 20,  "15\u201320 min"),
+        (2,  25, 30,  "25\u201330 min"),
+        (3,  31, 999, "30+ min"),   # strictly > 30; a 30-min video is "25-30"
+    ]
+    durations_with_videos = set()
+    for v in EXERCISE_VIDEOS:
+        d = v.get("duration_minutes")
+        if d is None:
+            continue
+        for order, lo, hi, label in bracket_defs:
+            if lo <= d <= hi:
+                durations_with_videos.add((order, label))
+
+    available = sorted(durations_with_videos)           # sort by order key
+    dur_labels = [label for _, label in available]
+    if len(dur_labels) > 1:
+        dur_str = ", ".join(dur_labels[:-1]) + ", or " + dur_labels[-1]
+    elif dur_labels:
+        dur_str = dur_labels[0]
+    else:
+        dur_str = "10\u201315 min, 15\u201320 min, or 25\u201330 min"
+
+    return cats_str, dur_str
+
+
+# Compute once at startup — injected into the system prompt so the chatbot
+# only offers options that have at least one matching video.
+_EXERCISE_AVAILABLE_CATEGORIES, _EXERCISE_AVAILABLE_DURATIONS = _compute_exercise_options()
+logger.info(
+    "Exercise options — categories: [%s] | durations: [%s]",
+    _EXERCISE_AVAILABLE_CATEGORIES,
+    _EXERCISE_AVAILABLE_DURATIONS,
+)
 
 
 def _infer_difficulty_from_le8(le8_data: dict) -> str:
@@ -377,34 +509,35 @@ def _infer_difficulty_from_le8(le8_data: dict) -> str:
 
 def _detect_exercise_filters(history: list) -> dict:
     """
-    Scan the full conversation history for answers to the four exercise
-    preference questions [EV1]–[EV4] and return a structured filters dict.
+    Scan conversation history for answers to the four exercise preference
+    questions [EV1]–[EV4] and return a structured filters dict.
 
-    Empty lists / None values mean that question hasn't been answered yet.
-    Only the most recent MAX_HISTORY_STORED messages are scanned to prevent
-    stale preferences from old conversations bleeding in.
+    EV1 / EV2 / EV3 (single-answer questions): scan messages NEWEST-FIRST and
+    stop at the first message that contains a relevant keyword.  This means
+    the user’s most recent answer wins — if they said \u201cdumbbell\u201d earlier
+    and then \u201cwait, I want bodyweight instead\u201d, only \u201cbodyweight\u201d is used.
+
+    EV4 (movement exclusions): accumulate across all messages since a user
+    may report multiple limitations in separate turns, and they rarely undo
+    an exclusion.  Deduplication prevents double-adding.
     """
     filters: dict = {
-        "categories":  [],
-        "format":      [],
+        "categories":   [],
+        "format":       [],
         "duration_min": None,
         "duration_max": None,
-        "exclusions":  [],
+        "exclusions":   [],
     }
 
-    # Cap scan to recent history to avoid stale-preference pollution
-    user_text = " ".join(
-        msg["content"].lower()
-        for msg in history[-MAX_HISTORY_STORED:]
+    user_msgs = [
+        msg for msg in history[-MAX_HISTORY_STORED:]
         if isinstance(msg, dict) and msg.get("role") == "user"
-    ).strip()
-
-    if not user_text:
+    ]
+    if not user_msgs:
         return filters
 
-    # ── [EV1] Workout category ───────────────────────────────────────────────
-    # Order matters: "chair yoga" must be checked before plain "yoga" so we
-    # don't add both tags when the user says "chair yoga".
+    # ── [EV1] Workout category ──────────────────────────────────────────
+    # Order matters: \u201cchair yoga\u201d before \u201cyoga\u201d so we don\u2019t add both.
     category_keywords = [
         ("chair yoga",       "Chair Yoga"),
         ("tai chi",          "Tai Chi"),
@@ -417,72 +550,120 @@ def _detect_exercise_filters(history: list) -> dict:
         ("body weight",      "Bodyweight"),
         ("yoga",             "Yoga"),
     ]
-    seen_cats: set = set()
-    for kw, cat in category_keywords:
-        if kw in user_text and cat not in seen_cats:
-            # Don't add plain "Yoga" if "Chair Yoga" is already captured
-            if cat == "Yoga" and "Chair Yoga" in seen_cats:
+    # Correction signal: words that indicate the user is changing their answer.
+    # When present alongside multiple categories in the same message, only the
+    # category whose keyword appears LATEST in the text is used — that’s the
+    # new preference.  Example: \u201cI said dumbbell but I want bodyweight instead\u201d
+    # → \u201cbodyweight\u201d appears after \u201cinstead/but\u201d so it wins.
+    CORRECTION_RE = re.compile(
+        r"\b(instead|actually|wait|i meant|rather\b|but i want|but now|change to|"
+        r"switch to|forget the|scratch that|no,?\s+i want|not \w+ but)\b",
+        re.IGNORECASE,
+    )
+    for msg in reversed(user_msgs):
+        msg_lower = msg["content"].lower()
+        # Record the position of the first occurrence of each category keyword.
+        cat_positions: dict = {}   # cat -> earliest char position in message
+        seen_in_msg: set = set()
+        for kw, cat in category_keywords:
+            pos = msg_lower.find(kw)
+            if pos == -1 or cat in seen_in_msg:
                 continue
-            filters["categories"].append(cat)
-            seen_cats.add(cat)
+            if cat == "Yoga" and "Chair Yoga" in seen_in_msg:
+                continue
+            cat_positions[cat] = pos
+            seen_in_msg.add(cat)
+        if not cat_positions:
+            continue  # no category in this message; keep looking backwards
+        if len(cat_positions) > 1 and CORRECTION_RE.search(msg_lower):
+            # Multiple categories in a correction message — the user is
+            # changing their mind.  Keep only the LAST-mentioned category
+            # (the new preference comes after the correction signal).
+            new_cat = max(cat_positions, key=lambda c: cat_positions[c])
+            filters["categories"] = [new_cat]
+        else:
+            filters["categories"] = list(cat_positions.keys())
+        break  # most-recent message with a category keyword wins
 
-    # ── [EV2] Format (seated / standing / mix) ───────────────────────────────
-    has_seated   = bool(re.search(r"\bseated\b", user_text))
-    has_standing = bool(re.search(r"\bstanding\b", user_text))
-    # Use "mix" / "mixed" only — "both" is too common a word to be a reliable signal
-    has_mix      = bool(re.search(r"\bmix\b|\bmixed\b", user_text))
+    # ── [EV2] Format (seated / standing / mix) ──────────────────────────
+    for msg in reversed(user_msgs):
+        msg_lower = msg["content"].lower()
+        has_seated   = bool(re.search(r"\bseated\b",         msg_lower))
+        has_standing = bool(re.search(r"\bstanding\b",       msg_lower))
+        has_mix      = bool(re.search(r"\bmix\b|\bmixed\b",  msg_lower))
+        if has_seated or has_standing or has_mix:
+            if has_seated and not has_standing:
+                filters["format"].append("Seated")
+            if has_standing and not has_seated:
+                filters["format"].append("Standing")
+            if has_mix or (has_seated and has_standing):
+                filters["format"].append("Mix")
+            break  # most-recent message with a format keyword wins
 
-    if has_seated and not has_standing:
-        filters["format"].append("Seated")
-    if has_standing and not has_seated:
-        filters["format"].append("Standing")
-    if has_mix or (has_seated and has_standing):
-        if "Mix" not in filters["format"]:
-            filters["format"].append("Mix")
+    # ── [EV3] Duration ───────────────────────────────────────────────────
+    # Primary: explicit numeric ranges (e.g. "15-20 min", "25 to 30").
+    # Secondary: "a X-min" or "X-min one/workout" in workout context, covering
+    # phrases like "a 15-min one", "show me a 10-minute workout".  Avoids
+    # false positives like "I walk 15 minutes a day" (no article before the
+    # duration, no workout noun after it).
+    # Newest-first: stop at the first message that contains any duration signal.
+    def _minutes_to_bracket(mins: int):
+        if mins <= 14:  return (10, 15)
+        if mins <= 20:  return (15, 20)
+        if mins <= 30:  return (25, 30)
+        return (31, 999)
 
-    # ── [EV3] Duration ───────────────────────────────────────────────────────
-    # Match explicit duration ranges only — do NOT match standalone "10 min"
-    # because "I walk 10 minutes a day" is a very common health context phrase
-    # that has nothing to do with answering EV3.
-    if re.search(r"10\s*[-–to]+\s*15", user_text):
-        filters["duration_min"], filters["duration_max"] = 10, 15
-    elif re.search(r"15\s*[-–to]+\s*20", user_text):
-        filters["duration_min"], filters["duration_max"] = 15, 20
-    elif re.search(r"25\s*[-–to]+\s*30", user_text):
-        filters["duration_min"], filters["duration_max"] = 25, 30
-    elif re.search(r"30\s*\+|over\s+30|more\s+than\s+30|longer\s+than\s+30", user_text):
-        filters["duration_min"], filters["duration_max"] = 30, 999
+    for msg in reversed(user_msgs):
+        t = msg["content"].lower()
+        if re.search(r"10\s*[-\u2013to]+\s*15", t):
+            filters["duration_min"], filters["duration_max"] = 10, 15; break
+        if re.search(r"15\s*[-\u2013to]+\s*20", t):
+            filters["duration_min"], filters["duration_max"] = 15, 20; break
+        if re.search(r"25\s*[-\u2013to]+\s*30", t):
+            filters["duration_min"], filters["duration_max"] = 25, 30; break
+        if re.search(
+            r"30\s*\+|30\s*plus|30\s*or\s*more|over\s+30|more\s+than\s+30|longer\s+than\s+30",
+            t,
+        ):
+            filters["duration_min"], filters["duration_max"] = 31, 999; break
+        # Secondary: article+duration or duration+workout-noun
+        m = (
+            re.search(r"\ba\s+(\d+)[\s-]min", t)                              # "a 15-min"
+            or re.search(r"\b(\d+)[\s-]min(?:ute)?s?\s+(?:one|workout|video|session)\b", t)  # "15-min one"
+        )
+        if m:
+            filters["duration_min"], filters["duration_max"] = _minutes_to_bracket(int(m.group(1)))
+            break
 
-    # ── [EV4] Movement exclusions ────────────────────────────────────────────
-    if re.search(r"\bbalanc", user_text):
+    # ── [EV4] Movement exclusions ────────────────────────────────────────
+    # Accumulate across all messages (users report limitations in separate
+    # turns and rarely undo them).  Guard against duplicates.
+    all_user_text = " ".join(m["content"].lower() for m in user_msgs)
+    if re.search(r"\bbalanc", all_user_text) and "balance" not in filters["exclusions"]:
         filters["exclusions"].append("balance")
-    # Use \bjumping\b instead of \bjump to avoid matching "jump in",
-    # "jump start", "jump from X to Y" which are common conversational phrases.
-    if re.search(r"\bjumping\b", user_text):
+    if re.search(r"\bjumping\b", all_user_text) and "jump" not in filters["exclusions"]:
         filters["exclusions"].append("jump")
-    if re.search(r"\bkneel", user_text):
+    if re.search(r"\bkneel", all_user_text) and "kneel" not in filters["exclusions"]:
         filters["exclusions"].append("kneel")
 
     return filters
 
 
-def _match_exercise_videos(filters: dict, difficulty: str) -> list:
+def _match_exercise_videos(filters: dict, difficulty: str) -> tuple:
     """
-    Match EXERCISE_VIDEOS against the user's preferences using AND logic with
-    progressive fallback.  Hard movement exclusions (balance/jump/kneel) are
-    always enforced regardless of fallback level.
+    Match EXERCISE_VIDEOS against user preferences with progressive fallback.
+    Hard movement exclusions are always enforced.
 
-    Fallback order (most specific → least specific):
-      0. category + difficulty + duration + format
-      1. category + difficulty + duration
-      2. category + difficulty
-      3. category only
-      4. any eligible video (exclusions still applied)
-
-    Returns up to MAX_EXERCISE_VIDEOS matches.
+    Returns (videos, fallback_level) where fallback_level is:
+      0 = all filters matched exactly
+      1 = format relaxed
+      2 = duration relaxed
+      3 = difficulty relaxed
+      4 = category relaxed (any category)
+      -1 = no videos loaded or no categories specified
     """
     if not EXERCISE_VIDEOS:
-        return []
+        return [], -1
 
     categories_lower  = [c.lower() for c in (filters.get("categories") or [])]
 
@@ -490,7 +671,8 @@ def _match_exercise_videos(filters: dict, difficulty: str) -> list:
     # preference).  Without categories we'd fall through to level-4 fallback and
     # return arbitrary videos with no relevance to what the user wants.
     if not categories_lower:
-        return []
+        return [], -1
+
     format_lower      = [f.lower() for f in (filters.get("format")      or [])]
     dur_min           = filters.get("duration_min")
     dur_max           = filters.get("duration_max")
@@ -530,9 +712,105 @@ def _match_exercise_videos(filters: dict, difficulty: str) -> list:
         elif level == 3: results = [v for v in eligible if cat_ok(v)]
         else:            results = eligible
         if results:
-            return results[:MAX_EXERCISE_VIDEOS]
+            return results[:MAX_EXERCISE_VIDEOS], level
 
-    return []
+    return [], -1
+
+
+def _ev4_was_asked(history: list) -> bool:
+    """
+    Return True if the chatbot has already asked the EV4 movement-exclusions
+    question in this conversation.
+
+    Detection: looks for the distinctive triple of 'balanc', 'jumping', and
+    'kneeling' in any single assistant message.  Using 'balanc' (prefix) covers
+    both 'balance' and 'balancing' regardless of how the chatbot phrases it.
+
+    Accepts the full sanitized history (not just truncated_history) so the
+    gate stays open even in long conversations where EV4 was asked > 20
+    turns ago.
+    """
+    for msg in history:
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", "").lower()
+        if "balanc" in content and "jumping" in content and "kneeling" in content:
+            return True
+    return False
+
+
+def _build_exercise_match_note(filters: dict, difficulty: str, fallback_level: int, videos: list) -> str:
+    """
+    Build a mismatch instruction injected as a late system message so the
+    model acknowledges unavailable videos honestly.  Returns empty string
+    when the match was exact (fallback_level == 0) or no videos were found.
+    """
+    if fallback_level <= 0 or not videos:
+        return ""
+
+    cats     = ", ".join(filters.get("categories") or [])
+    dur_min  = filters.get("duration_min")
+    dur_max  = filters.get("duration_max")
+    fmts     = ", ".join(filters.get("format") or [])
+
+    # Human-readable duration label
+    if dur_min and dur_max:
+        dur_label = "30+ min" if dur_max >= 999 else f"{dur_min}\u2013{dur_max} min"
+    else:
+        dur_label = None
+
+    # What was actually found — sanitize CSV-derived values before injecting
+    # into the system message (defense in depth against unexpected CSV content).
+    found_durs = sorted({v["duration_minutes"] for v in videos if v.get("duration_minutes")})
+    found_dur_str = ", ".join(f"{d} min" for d in found_durs) if found_durs else "varying lengths"
+    found_cats = _sanitize_prompt_str(
+        ", ".join(sorted({v["category"] for v in videos})), 80
+    )
+
+    requested_desc = cats or "any category"
+    if dur_label:   requested_desc += f", {dur_label}"
+    if difficulty:  requested_desc += f", {difficulty} level"
+    if fmts:        requested_desc += f", {fmts} format"
+
+    if fallback_level == 1:
+        mismatch = (
+            f"No {cats} videos matched the format preference ({fmts}). "
+            f"The surfaced video(s) have a different format."
+        )
+    elif fallback_level == 2:
+        mismatch = (
+            f"NO {cats} videos of {dur_label} exist in the library. "
+            f"The closest {cats} options are {found_dur_str}."
+        )
+    elif fallback_level == 3:
+        mismatch = (
+            f"No {cats} videos matched {difficulty} difficulty for "
+            f"{dur_label or 'that duration'}. "
+            f"Surfacing {cats} videos at a different difficulty level."
+        )
+    else:
+        mismatch = (
+            f"No {cats} videos matched the requested filters. "
+            f"Surfacing alternatives (categories: {found_cats})."
+        )
+
+    dur_clause = f" in the {dur_label} range" if dur_label else ""
+    return (
+        f"EXERCISE VIDEO MISMATCH — YOU MUST FOLLOW THESE INSTRUCTIONS:\n"
+        f"The user's CURRENT requested category: {cats}\n"
+        f"The user requested: {requested_desc}\n"
+        f"PROBLEM: {mismatch}\n\n"
+        f"REQUIRED RESPONSE STRUCTURE:\n"
+        f"1. YOUR VERY FIRST SENTENCE must name \"{cats}\" as what is unavailable.\n"
+        f'   REQUIRED OPENER: "We don\u2019t currently have {cats} workouts{dur_clause}."\n'
+        f"   Use exactly this category name. Do NOT substitute any other category "
+        f"(e.g. do not say Bodyweight, Dumbbell, etc.) unless that is \"{cats}\".\n"
+        "2. Immediately offer what IS available as a solid alternative.\n"
+        "3. Do NOT say you are finding videos that match their exact request "
+        "\u2014 they do not exist.\n"
+        "4. You may add exercise tips from the health literature context \u2014 "
+        "do not invent or cite anything not in that context.\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1001,7 +1279,7 @@ def retrieve_context(
     return {"context": context_str, "chunks": chunk_details, "animations": animations}
 
 
-def _geocode_city(city: str) -> tuple[float, float, str] | None:
+def _geocode_city(city: str) -> tuple | None:
     """
     Resolve a city name to (latitude, longitude, iana_timezone).
     The IANA timezone string (e.g. 'America/Chicago') comes free from
@@ -1079,7 +1357,7 @@ def get_weather(city: str = "Columbus", city_info=None) -> str:
         wind_dir  = _sanitize_prompt_str(str(current.get("windDirection",    "")), 20)
         wind_spd  = _sanitize_prompt_str(str(current.get("windSpeed",        "")), 20)
         return (
-            f"{city}: {temp}°{temp_unit}, "
+            f"{city}: {temp}\u00b0{temp_unit}, "
             f"{forecast}, "
             f"wind {wind_dir} {wind_spd}"
         )
@@ -1345,6 +1623,30 @@ def chatbot():
     # Detect whether the user is explicitly asking for research sources
     include_references = bool(REFERENCE_INTENT_PATTERN.search(user_message))
 
+    # ---------------------------------------------------------------------------
+    # Exercise video matching (runs before the LLM call so the match note can
+    # be injected as a late system message for this turn).
+    # Use the full sanitized history (up to MAX_HISTORY_STORED messages) for
+    # both filter detection and the EV4 gate so long conversations don't lose
+    # earlier preference answers or EV4 being asked >20 turns ago.
+    # ---------------------------------------------------------------------------
+    truncated_history   = history[-MAX_HISTORY_MESSAGES:]
+    pre_turn_msgs       = history + [{"role": "user", "content": user_message}]
+    curr_filters        = _detect_exercise_filters(pre_turn_msgs)
+    exercise_difficulty = _infer_difficulty_from_le8(le8_data)
+    min_filters_set     = (
+        bool(curr_filters.get("categories"))
+        and curr_filters.get("duration_min") is not None
+    )
+    if min_filters_set and _ev4_was_asked(history):
+        exercise_videos, fallback_level = _match_exercise_videos(curr_filters, exercise_difficulty)
+        exercise_match_note = _build_exercise_match_note(
+            curr_filters, exercise_difficulty, fallback_level, exercise_videos
+        )
+    else:
+        exercise_videos     = []
+        exercise_match_note = ""
+
     try:
         rag_result = retrieve_context(
             rag_query,
@@ -1593,7 +1895,7 @@ DOMAIN-SPECIFIC FIELDS (collect in addition to the universal fields):
 
   BLOOD PRESSURE:
   [BP1] Sodium awareness — do they currently track or think about sodium?
-  [BP2] Stress level — how would they rate their current stress on 1–10?
+  [BP2] Stress level — how would they rate their current stress on 1\u201310?
   [BP3] Relaxation practices — any current stress-management habits?
   [BP4] Medication context — are they on BP medication? (for goal-setting
         expectations only — never advise on medication.)
@@ -1648,6 +1950,19 @@ MI TECHNIQUE DURING INTAKE:
 ─────────────────────────────────────────────────────────
 PHASE 2 — SYNTHESIS (only after all required fields are collected)
 ─────────────────────────────────────────────────────────
+BEFORE drafting the goal, apply these substitution rules:
+
+  EQUIPMENT / ACCESS SUBSTITUTION (Physical Activity domain):
+  If the user said they do NOT have the equipment their preferred
+  activity requires, DO NOT include that activity anywhere in the goal.
+  Substitute a no-equipment alternative and use it consistently across
+  ALL five SMART components and the daily schedule.
+    - No bike        → brisk walking, marching in place, or step-ups
+    - No pool        → walking or indoor bodyweight cardio
+    - No gym/weights → bodyweight exercises (push-ups, squats, lunges)
+    - No equipment   → bodyweight only
+  Never mention the unavailable activity anywhere in the synthesis output.
+
 Draft the SMART goal using this exact structure:
 
   "Here's a goal based on what you've shared:
@@ -1657,7 +1972,7 @@ Draft the SMART goal using this exact structure:
                 frequency]
   Achievable:  [grounded in their baseline, schedule, and constraints]
   Relevant:    [tied to their LE8 metric and stated motivation]
-  Time-bound:  [start date or this week, with a check-in in 2–4 weeks]
+  Time-bound:  [start date or this week, with a check-in in 2\u20134 weeks]
 
   Based on your schedule, a realistic plan looks like:
   [Day] at [Time] — [Activity / Action], [Duration / Amount]
@@ -1672,7 +1987,7 @@ get started?" — this is the MI commitment/activation step.
 
 After they confirm the goal, note which LE8 metric it targets and what
 score improvement they could realistically expect if they hit the goal
-consistently for 4–8 weeks.
+consistently for 4\u20138 weeks.
 
 REFERENCES:
 - The CONTEXT may include References blocks. Present these as a brief bulleted
@@ -1686,40 +2001,47 @@ chair yoga, tai chi) that are surfaced as cards automatically alongside your
 response — you do NOT need to list URLs or embed links yourself.
 
 WHEN TO ASK THE PREFERENCE QUESTIONS:
-1. During PA SMART Goal intake: after completing [PA1]–[PA4], ask [EV1]–[EV4]
+1. During PA SMART Goal intake: after completing [PA1]\u2013[PA4], ask [EV1]\u2013[EV4]
    in order before moving to PHASE 2 SYNTHESIS.
-2. Whenever the user asks about exercises, workouts, or videos — e.g.
+2. Whenever the user asks about exercises, workouts, or videos \u2014 e.g.
    "what exercises should I do?", "show me a workout", "do you have videos?",
    "what can I do at home?".
+3. DO NOT restart [EV1]–[EV4] once they have already been answered. If
+   the user says things like "try another workout", "I want to try other
+   workout", "show me something different", or "give me another one",
+   treat these as requests to surface more videos with current preferences
+   and surface immediately — do NOT ask "what kind?" or restart [EV1].
 
-THE 4 PREFERENCE QUESTIONS — ask exactly one per turn in this order:
+THE 4 PREFERENCE QUESTIONS \u2014 ask exactly one per turn in this order:
 
   [EV1] "What kinds of workouts do you enjoy or want to try? You can choose
-         as many as you like: bodyweight, dumbbells, resistance bands, yoga,
-         chair yoga, or tai chi."
+         as many as you like: {_EXERCISE_AVAILABLE_CATEGORIES}."
 
   [EV2] "Do you prefer workouts that are all seated, all standing, or
          a mix of both?"
 
   [EV3] "How long would you like your workouts to be?
-         Options: 10–15 min, 15–20 min, 25–30 min, or 30+ min."
+         Available options: {_EXERCISE_AVAILABLE_DURATIONS}."
 
-  [EV4] "Are any of these movements difficult or uncomfortable for you —
+  [EV4] "Are any of these movements difficult or uncomfortable for you \u2014
          balancing, jumping, or kneeling? Say 'none' if none apply."
 
 MI STYLE: one question per turn, brief warm reflection after each answer,
 affirm their preferences, never pressure toward a specific choice.
 
 AFTER COLLECTING ANSWERS:
-- Tell the user the system is finding matching videos for them.
+- Tell the user you are surfacing matching videos for them.
 - Do NOT list, guess, or fabricate any video URLs yourself.
-- The video cards will surface automatically alongside this response.
-- If physical limitations were mentioned, briefly acknowledge them
-  before transitioning: "Great — I'll make sure to filter out anything
-  that involves [limitation] for you."
+- Video cards surface automatically alongside your response.
+- If physical limitations were mentioned, briefly acknowledge them.
+- If the user changes any preference (category, format, or duration) after videos
+  have already been surfaced, apply the change immediately and say you are
+  surfacing updated videos. Do NOT ask "Would you like me to show you?" or
+  "Should I find some X videos?" — just do it. Never ask for confirmation on a
+  preference the user has already expressed.
 
 IF ASKED ABOUT EXERCISES WITHOUT ANY PRIOR PREFERENCES:
-- Ask [EV1] first. Collect [EV1]–[EV4] before surfacing recommendations.
+- Ask [EV1] first. Collect [EV1]\u2013[EV4] before surfacing recommendations.
 
 RESPONSE FORMAT:
 - Warm, concise (under 200 words when possible), and encouraging.
@@ -1729,8 +2051,11 @@ RESPONSE FORMAT:
 - When listing options, keep it to 2-3 choices to avoid overwhelming the user."""
 
     messages = [{"role": "system", "content": system_prompt}]
-    truncated_history = history[-MAX_HISTORY_MESSAGES:]
     messages.extend(truncated_history)
+    # Inject the mismatch note as a final system message right before the
+    # user's turn — maximum recency ensures the model acts on it.
+    if exercise_match_note:
+        messages.append({"role": "system", "content": exercise_match_note})
     messages.append({"role": "user", "content": user_message})
 
     try:
@@ -1765,25 +2090,6 @@ RESPONSE FORMAT:
         {"role": "user", "content": user_message},
         {"role": "assistant", "content": reply},
     ]
-
-    # ---------------------------------------------------------------------------
-    # Exercise video matching
-    # Run after the LLM call so the updated history (including this turn's user
-    # message) is passed to filter detection.  Matching only fires when the user
-    # shows exercise intent OR has already answered at least EV1 + EV3 (category
-    # + duration), so videos don't surface on every unrelated message.
-    # ---------------------------------------------------------------------------
-    exercise_filters   = _detect_exercise_filters(updated_history)
-    exercise_difficulty = _infer_difficulty_from_le8(le8_data)
-    exercise_intent    = bool(EXERCISE_VIDEO_INTENT_PATTERN.search(user_message))
-    min_filters_set    = (
-        bool(exercise_filters.get("categories"))
-        and exercise_filters.get("duration_min") is not None
-    )
-    if exercise_intent or min_filters_set:
-        exercise_videos = _match_exercise_videos(exercise_filters, exercise_difficulty)
-    else:
-        exercise_videos = []
 
     response_data = {"reply": reply, "history": updated_history, "animations": animations, "exercise_videos": exercise_videos}
 
