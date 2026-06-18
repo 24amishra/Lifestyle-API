@@ -18,6 +18,7 @@ services:
       - ./back-end/animation_overrides.json:/app/animation_overrides.json
       - ./back-end/mock_fitbit_data.json:/app/mock_fitbit_data.json
       - ./back-end/documents:/app/documents
+      - "./back-end/Exercise Library.csv:/app/Exercise Library.csv"
       - backend-chroma:/app/chroma_db
     depends_on: []
 

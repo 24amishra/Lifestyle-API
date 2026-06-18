@@ -180,20 +180,6 @@ EV_COL_LINK       = "link"        # Vimeo URL
 # Maximum exercise video cards surfaced per response
 MAX_EXERCISE_VIDEOS = 3
 
-# Detects when a user message is explicitly asking to see or do a workout/video.
-# Deliberately narrow: excludes generic health words like "active", "activity",
-# "training", "fitness" that appear constantly in LE8 conversations and would
-# cause exercise videos to surface on almost every message.
-EXERCISE_VIDEO_INTENT_PATTERN = re.compile(
-    r"\b(workout|workouts|work out|"
-    r"show me a workout|show me some exercises|"
-    r"do you have videos|exercise videos|what videos|"
-    r"what can i do at home|what exercises should i do|"
-    r"recommend.*workout|suggest.*workout|suggest.*exercise)\b",
-    re.IGNORECASE,
-)
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -773,41 +759,60 @@ def _build_exercise_match_note(filters: dict, difficulty: str, fallback_level: i
     if fmts:        requested_desc += f", {fmts} format"
 
     if fallback_level == 1:
-        mismatch = (
-            f"No {cats} videos matched the format preference ({fmts}). "
-            f"The surfaced video(s) have a different format."
+        # Format relaxed: have category + duration, just not the requested format
+        found_fmts = ", ".join(sorted({v["format"] for v in videos if v.get("format")})) or "a different format"
+        opener = (
+            f"We don't have a {fmts} {cats} workout"
+            f"{' in the ' + dur_label + ' range' if dur_label else ''} — "
+            f"the closest option is {found_fmts}."
+        )
+        body = (
+            f"1. YOUR VERY FIRST SENTENCE: \"{opener}\"\n"
+            f"2. Present the video positively — it IS the right category and duration.\n"
+            f"3. CRITICAL: Do NOT call this a '{fmts}' workout or imply it is "
+            f"'{fmts}'. It is {found_fmts}. Contradicting this confuses the user.\n"
+            f"4. Do NOT suggest a different category."
         )
     elif fallback_level == 2:
-        mismatch = (
-            f"NO {cats} videos of {dur_label} exist in the library. "
-            f"The closest {cats} options are {found_dur_str}."
+        # Duration relaxed: have category, but not at this duration
+        opener = f"We don't currently have {cats} workouts in the {dur_label} range."
+        body = (
+            f"1. YOUR VERY FIRST SENTENCE: \"{opener}\"\n"
+            f"2. Offer the closest {cats} options available ({found_dur_str}) as a solid alternative.\n"
+            f"3. Do NOT suggest a different category \u2014 we have {cats}, just not at that duration."
         )
     elif fallback_level == 3:
-        mismatch = (
-            f"No {cats} videos matched {difficulty} difficulty for "
-            f"{dur_label or 'that duration'}. "
-            f"Surfacing {cats} videos at a different difficulty level."
+        # Difficulty relaxed: have category + duration, just not at the inferred difficulty
+        found_diffs = ", ".join(sorted({v["difficulty"] for v in videos}))
+        opener = (
+            f"We have {cats} workouts{' in the ' + dur_label + ' range' if dur_label else ''} "
+            f"but not at {difficulty} level \u2014 surfacing {found_diffs} options instead."
+        )
+        body = (
+            f"1. Briefly note that {difficulty}-level {cats} workouts aren't available"
+            f"{' in the ' + dur_label + ' range' if dur_label else ''}, "
+            f"but {found_diffs} options are.\n"
+            f"2. Present the video positively \u2014 it IS the right category"
+            f"{' and duration' if dur_label else ''}.\n"
+            "3. Do NOT suggest a different category or workout type."
         )
     else:
-        mismatch = (
-            f"No {cats} videos matched the requested filters. "
-            f"Surfacing alternatives (categories: {found_cats})."
+        # Category/all relaxed: nothing matched, surfacing alternatives
+        opener = f"We don't have {cats} workouts matching your preferences right now."
+        body = (
+            f"1. YOUR VERY FIRST SENTENCE: \"{opener}\"\n"
+            f"2. Present the closest alternative available (categories: {found_cats}).\n"
+            "3. Offer to adjust preferences if the alternative doesn't suit them."
         )
 
     dur_clause = f" in the {dur_label} range" if dur_label else ""
     return (
-        f"EXERCISE VIDEO MISMATCH — YOU MUST FOLLOW THESE INSTRUCTIONS:\n"
+        f"EXERCISE VIDEO MISMATCH \u2014 YOU MUST FOLLOW THESE INSTRUCTIONS:\n"
         f"The user's CURRENT requested category: {cats}\n"
         f"The user requested: {requested_desc}\n"
-        f"PROBLEM: {mismatch}\n\n"
+        f"What was actually surfaced: {found_cats}, {found_dur_str}\n\n"
         f"REQUIRED RESPONSE STRUCTURE:\n"
-        f"1. YOUR VERY FIRST SENTENCE must name \"{cats}\" as what is unavailable.\n"
-        f'   REQUIRED OPENER: "We don\u2019t currently have {cats} workouts{dur_clause}."\n'
-        f"   Use exactly this category name. Do NOT substitute any other category "
-        f"(e.g. do not say Bodyweight, Dumbbell, etc.) unless that is \"{cats}\".\n"
-        "2. Immediately offer what IS available as a solid alternative.\n"
-        "3. Do NOT say you are finding videos that match their exact request "
-        "\u2014 they do not exist.\n"
+        f"{body}\n"
         "4. You may add exercise tips from the health literature context \u2014 "
         "do not invent or cite anything not in that context.\n"
     )
@@ -1634,10 +1639,12 @@ def chatbot():
     pre_turn_msgs       = history + [{"role": "user", "content": user_message}]
     curr_filters        = _detect_exercise_filters(pre_turn_msgs)
     exercise_difficulty = _infer_difficulty_from_le8(le8_data)
-    min_filters_set     = (
-        bool(curr_filters.get("categories"))
-        and curr_filters.get("duration_min") is not None
-    )
+    # Only require a category to be set before surfacing videos.
+    # Duration is optional — the fallback system handles mismatches gracefully
+    # (level-2 fallback) and _build_exercise_match_note informs the LLM.
+    # Requiring duration here caused videos to never surface when EV3 was
+    # skipped or the user didn't explicitly specify a duration range.
+    min_filters_set     = bool(curr_filters.get("categories"))
     if min_filters_set and _ev4_was_asked(history):
         exercise_videos, fallback_level = _match_exercise_videos(curr_filters, exercise_difficulty)
         exercise_match_note = _build_exercise_match_note(
@@ -1841,13 +1848,30 @@ SMART Goal Mode has two phases: INTAKE and SYNTHESIS.
 ─────────────────────────────────────────────────────────
 PHASE 1 — INTAKE (ask ONE question per turn, in order)
 ─────────────────────────────────────────────────────────
-Do not skip ahead. Do not combine questions. Do not draft the goal
-until all required fields for the relevant domain are collected.
-If the user volunteers information that answers a later question,
-acknowledge it and skip that question — never ask for it again.
+STRICT RULES — violation breaks the MI protocol:
+- Ask EXACTLY ONE question per response. Stop after that question.
+- NEVER list, preview, or number upcoming questions in the same response.
+  Wrong: "2. Motivation: ... 3. Past attempts: ... 4. Availability: ..."
+  Right: Ask only the single next unanswered field, nothing else after it.
+- NEVER number the current question (e.g. do not write "2. Motivation:").
+  Numbering implies a list; a listed question is a multi-question dump.
+- Do not skip ahead. Do not combine questions. Do not draft the goal
+  until all required fields for the relevant domain are collected.
+- If the user volunteers information that answers a later question,
+  acknowledge it and skip that question — never ask for it again.
 
 Track mentally which fields below are still missing. Move to SYNTHESIS
 only when all required fields for the domain are filled.
+
+CRITICAL — ONE QUESTION ONLY PER TURN. This is non-negotiable.
+NEVER produce a numbered or bulleted list of intake questions.
+The following pattern is FORBIDDEN:
+  "To get started, I need to ask a few questions:
+  1. Current baseline: ...
+  2. Motivation: ...
+  3. Past attempts: ..."
+Instead, ask only the FIRST unanswered question, then stop and wait
+for the user's reply before proceeding to the next one.
 
 UNIVERSAL FIELDS (required for every domain):
   [U1] Goal domain — confirm which LE8 metric this is about.
@@ -1963,7 +1987,14 @@ BEFORE drafting the goal, apply these substitution rules:
     - No equipment   → bodyweight only
   Never mention the unavailable activity anywhere in the synthesis output.
 
-Draft the SMART goal using this exact structure:
+Draft the SMART goal using this exact structure. ALL five components are
+required — outputting only a schedule without the SMART breakdown is NOT
+a SMART goal and is forbidden.
+
+IMPORTANT: If an EXERCISE VIDEO MISMATCH system note is present for this
+turn, do NOT open with it. Complete the full SMART goal synthesis first
+(all five components + schedule + "Does this feel right?"). After the
+SMART goal, you may briefly note the video situation on a new line.
 
   "Here's a goal based on what you've shared:
 
@@ -2003,9 +2034,14 @@ response — you do NOT need to list URLs or embed links yourself.
 WHEN TO ASK THE PREFERENCE QUESTIONS:
 1. During PA SMART Goal intake: after completing [PA1]\u2013[PA4], ask [EV1]\u2013[EV4]
    in order before moving to PHASE 2 SYNTHESIS.
-2. Whenever the user asks about exercises, workouts, or videos \u2014 e.g.
+2. Whenever the user makes a DIRECT REQUEST for exercise content or videos \u2014 e.g.
    "what exercises should I do?", "show me a workout", "do you have videos?",
-   "what can I do at home?".
+   "what can I do at home?", "can you recommend a workout?".
+   CRITICAL DISTINCTION: "I want to exercise more" / "I want to be more active" /
+   "I should work out" / "I need to get moving" are CHANGE INTENTIONS, not direct
+   requests. These phrases trigger SMART Goal Mode (see SMART GOAL PROTOCOL above)
+   \u2014 start the intake at [U1], NOT [EV1]. You will ask [EV1]\u2013[EV4] only after
+   all SMART Goal intake fields [U1]\u2013[U6] and [PA1]\u2013[PA4] are completed.
 3. DO NOT restart [EV1]–[EV4] once they have already been answered. If
    the user says things like "try another workout", "I want to try other
    workout", "show me something different", or "give me another one",
@@ -2029,6 +2065,20 @@ THE 4 PREFERENCE QUESTIONS \u2014 ask exactly one per turn in this order:
 MI STYLE: one question per turn, brief warm reflection after each answer,
 affirm their preferences, never pressure toward a specific choice.
 
+CRITICAL GATING RULE — NEVER CLAIM TO SURFACE VIDEOS EARLY:
+- You MUST ask [EV1]–[EV4] one at a time before saying you are surfacing videos.
+- If the user says "yes", "sure", "okay", "please", or any short affirmative in
+  response to a question like "Would you like to see workout videos?" or "Would
+  you like to explore specific workout videos?", this is NOT an answer to [EV1].
+  Respond by asking [EV1]: "What kinds of workouts do you enjoy or want to try?"
+- Do NOT assume a category from the conversation context. Even if the conversation
+  mentioned "bodyweight" exercises, the user has not answered [EV1] until they
+  explicitly pick a category in direct reply to [EV1].
+- NEVER say you are "surfacing", "finding", "pulling up", or "showing" videos
+  until you have received explicit answers to ALL FOUR questions [EV1]–[EV4]
+  in this conversation. Claiming to surface videos before [EV4] has been asked
+  produces a broken experience where nothing appears on screen.
+
 AFTER COLLECTING ANSWERS:
 - Tell the user you are surfacing matching videos for them.
 - Do NOT list, guess, or fabricate any video URLs yourself.
@@ -2049,6 +2099,37 @@ RESPONSE FORMAT:
   tier, and one specific actionable step to improve it.
 - Plain language; avoid medical jargon unless the user uses it first.
 - When listing options, keep it to 2-3 choices to avoid overwhelming the user."""
+
+    # ---------------------------------------------------------------------------
+    # Suppress exercise video mismatch note during SMART goal synthesis.
+    # Heuristic: if the most recent assistant message contains SMART goal
+    # synthesis language, we're in or just completing synthesis — the mismatch
+    # note would hijack the opener and produce incomplete goals.
+    # ---------------------------------------------------------------------------
+    def _in_smart_goal_synthesis(history: list) -> bool:
+        for msg in reversed(history[-6:]):
+            if msg.get("role") != "assistant":
+                continue
+            c = msg.get("content", "").lower()
+            # Synthesis markers: field labels or schedule language
+            if any(marker in c for marker in (
+                "specific:", "measurable:", "achievable:", "relevant:",
+                "time-bound:", "based on your schedule", "here's a goal",
+                "does this feel right", "what's one small thing",
+            )):
+                return True
+            # Active intake markers: if the bot is still asking MI questions,
+            # we are NOT in synthesis yet.
+            if any(marker in c for marker in (
+                "what do you currently do", "what makes this change",
+                "have you tried", "which specific days", "how confident",
+                "what kind of movement", "do you have access",
+            )):
+                return False
+        return False
+
+    if exercise_match_note and _in_smart_goal_synthesis(history):
+        exercise_match_note = ""
 
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(truncated_history)
@@ -2086,7 +2167,14 @@ RESPONSE FORMAT:
             logger.error("OpenAI call failed: %s", e)
             return jsonify({"error": "AI call failed"}), 500
 
-    updated_history = truncated_history + [
+    # Return the FULL history (not truncated) so the frontend accumulates the
+    # complete conversation. Filter detection (_detect_exercise_filters) and the
+    # EV4 gate (_ev4_was_asked) both need access to messages older than 20 turns
+    # — using truncated_history here caused exercise preferences and EV4 state
+    # to be forgotten after ~11 turns. The LLM still only receives the last
+    # MAX_HISTORY_MESSAGES turns via truncated_history; the full history is only
+    # used for filter/gate logic. MAX_HISTORY_STORED (100) caps total size.
+    updated_history = history + [
         {"role": "user", "content": user_message},
         {"role": "assistant", "content": reply},
     ]
