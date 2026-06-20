@@ -118,13 +118,17 @@ CITY_PATTERN = re.compile(r"^[a-zA-Z\s\-'.]+$")
 # Chunks with distance > this value are considered off-topic and dropped.
 RAG_DISTANCE_THRESHOLD = 0.75
 
-# More lenient threshold used exclusively for surfacing animation cards.
-# A chunk doesn't need to be relevant enough to inform the LLM's answer to
-# still warrant showing the user a related video.
+# Lenient threshold for surfacing animation cards.
+# Animation script chunks embed differently from health questions (narrative vs
+# clinical language), so they consistently score above RAG_DISTANCE_THRESHOLD.
+# This separate threshold lets relevant animations surface even when their chunk
+# narrowly lost to a research-paper chunk for the same topic.
+# Cross-topic contamination (e.g. sleep animations during a PA intake turn) is
+# prevented separately by _animation_matches_conversation() in chatbot().
 ANIMATION_SURFACE_THRESHOLD = 0.82
 
 # Lenient threshold used for the source-diversity secondary query.
-# When all top chunks come from combined_scripts.pdf, we do a second ChromaDB
+# When all top chunks come from "combined scripts.pdf", we do a second ChromaDB
 # query that excludes that source and include the best result if its distance
 # is within this value. Set looser than RAG_DISTANCE_THRESHOLD so research
 # paper chunks (which tend to score slightly worse on conversational queries)
@@ -622,15 +626,31 @@ def _detect_exercise_filters(history: list) -> dict:
             break
 
     # ── [EV4] Movement exclusions ────────────────────────────────────────
-    # Accumulate across all messages (users report limitations in separate
-    # turns and rarely undo them).  Guard against duplicates.
-    all_user_text = " ".join(m["content"].lower() for m in user_msgs)
-    if re.search(r"\bbalanc", all_user_text) and "balance" not in filters["exclusions"]:
-        filters["exclusions"].append("balance")
-    if re.search(r"\bjumping\b", all_user_text) and "jump" not in filters["exclusions"]:
-        filters["exclusions"].append("jump")
-    if re.search(r"\bkneel", all_user_text) and "kneel" not in filters["exclusions"]:
-        filters["exclusions"].append("kneel")
+    # Only accumulate exclusions from user messages that came AFTER the EV4
+    # question was asked.  Scanning the full history caused false positives —
+    # e.g. "I need to balance my diet" or "I'm jumping into a new routine"
+    # from early in the conversation incorrectly added exercise exclusions.
+    _all_msgs_for_ev4 = history[-MAX_HISTORY_STORED:]
+    _ev4_asked_at = None
+    for _j, _m in enumerate(_all_msgs_for_ev4):
+        if _m.get("role") == "assistant":
+            _c = _m.get("content", "").lower()
+            if "balanc" in _c and "jumping" in _c and "kneeling" in _c:
+                _ev4_asked_at = _j
+                break
+
+    if _ev4_asked_at is not None:
+        _post_ev4_user_msgs = [
+            _m for _m in _all_msgs_for_ev4[_ev4_asked_at:]
+            if isinstance(_m, dict) and _m.get("role") == "user"
+        ]
+        _ev4_text = " ".join(_m["content"].lower() for _m in _post_ev4_user_msgs)
+        if re.search(r"\bbalanc", _ev4_text) and "balance" not in filters["exclusions"]:
+            filters["exclusions"].append("balance")
+        if re.search(r"\bjumping\b", _ev4_text) and "jump" not in filters["exclusions"]:
+            filters["exclusions"].append("jump")
+        if re.search(r"\bkneel", _ev4_text) and "kneel" not in filters["exclusions"]:
+            filters["exclusions"].append("kneel")
 
     return filters
 
@@ -1110,6 +1130,69 @@ def _build_rag_query(user_message: str, history: list) -> str:
     return user_message
 
 
+# ---------------------------------------------------------------------------
+# Animation topic-relevance guard
+# ---------------------------------------------------------------------------
+
+# Words too generic to use as topic signals — they appear across all health
+# domains and would cause false positives if used for overlap matching.
+_ANIM_STOPWORDS: frozenset = frozenset({
+    "that", "this", "they", "them", "their", "have", "with", "from",
+    "about", "what", "when", "where", "will", "your", "more", "some",
+    "been", "does", "into", "than", "then", "also", "just", "like",
+    "each", "much", "most", "make", "such", "know", "well", "help",
+    "need", "want", "feel", "time", "week", "days", "would", "could",
+    "should", "there", "these", "those", "were", "here", "okay",
+    "great", "sure", "good", "think", "really", "even", "going",
+    # Domain-neutral health words — present in every conversation
+    "goal", "score", "level", "health", "heart", "cancer", "patient",
+    "body", "care", "life", "risk", "data", "high", "lower", "better",
+    "improve", "increase", "reduce", "change", "start", "help", "work",
+})
+
+
+def _topic_words(text: str) -> set:
+    """
+    Extract meaningful content words (≥4 chars, not stopwords) from text.
+    Used to compare the recent conversation topic against an animation title.
+    """
+    words = re.findall(r"\b[a-zA-Z]{4,}\b", text.lower())
+    return {w for w in words if w not in _ANIM_STOPWORDS}
+
+
+def _animation_matches_conversation(
+    anim_title: str,
+    history: list,
+    current_message: str,
+    window: int = 10,
+) -> bool:
+    """
+    Return True if the animation section title shares at least one meaningful
+    keyword with the recent conversation, False otherwise.
+
+    This prevents cross-topic animation cards — e.g. a "Sleep Hygiene" card
+    surfacing mid-way through a Physical Activity MI intake — by requiring
+    that some word in the animation title also appears somewhere in the last
+    `window` messages.  Generic health words are excluded from the comparison
+    via _ANIM_STOPWORDS so they don't create false matches.
+
+    If the animation title has no meaningful keywords (e.g. a very short or
+    generic title), we allow it through rather than silently suppressing it.
+    """
+    title_words = _topic_words(anim_title)
+    if not title_words:
+        return True  # can't determine topic → don't filter
+
+    recent_msgs = list(history[-window:]) + [{"role": "user", "content": current_message}]
+    conv_text = " ".join(m.get("content", "") for m in recent_msgs)
+    conv_words = _topic_words(conv_text)
+
+    if not conv_words:
+        return True  # no conversation context yet → don't filter
+
+    return bool(title_words & conv_words)
+
+
 def retrieve_context(
     query: str,
     n_results: int = 7,
@@ -1186,10 +1269,13 @@ def retrieve_context(
         })
 
         # ----------------------------------------------------------------
-        # Animation surfacing — intentionally decoupled from use_chunk.
-        # Uses ANIMATION_SURFACE_THRESHOLD (more lenient than the context
-        # threshold) so a video can surface even when its chunk was too
-        # marginal to include in the LLM context.
+        # Animation surfacing — uses ANIMATION_SURFACE_THRESHOLD (more
+        # lenient than the context threshold) because script chunks embed
+        # in a different stylistic register than research chunks and tend
+        # to score slightly higher distances on the same health queries.
+        # Cross-topic contamination is handled downstream by
+        # _animation_matches_conversation() in chatbot() before the
+        # animations list is sent to the client.
         # ----------------------------------------------------------------
         anim_url = meta.get("animation_url", "")
         section_title = meta.get("section_title", "")
@@ -1222,7 +1308,7 @@ def retrieve_context(
         context_parts.append(block)
 
     # ----------------------------------------------------------------
-    # Source diversity: if every used chunk came from combined_scripts.pdf,
+    # Source diversity: if every used chunk came from "combined scripts.pdf",
     # run a second query that excludes that source and splice in the best
     # result that still clears SOURCE_DIVERSITY_THRESHOLD.  This ensures
     # the LLM can draw on research paper evidence when it is available.
@@ -1232,8 +1318,10 @@ def retrieve_context(
         for cd in chunk_details
         if cd["used_in_context"]
     }
+    # NOTE: the actual transcript filename is "combined scripts.pdf" (with a
+    # space, not an underscore).  Both checks must use the same spelling.
     script_only = bool(used_sources) and all(
-        "combined_scripts" in s.lower() for s in used_sources
+        "combined scripts" in s.lower() for s in used_sources
     )
     if script_only:
         try:
@@ -1241,7 +1329,7 @@ def retrieve_context(
                 query_embeddings=[query_embedding],
                 n_results=3,
                 include=["documents", "metadatas", "distances"],
-                where={"source": {"$ne": "combined_scripts.pdf"}},
+                where={"source": {"$ne": "combined scripts.pdf"}},
             )
             div_docs   = div_res["documents"][0]
             div_dists  = div_res["distances"][0]  if div_res.get("distances") else []
@@ -1452,14 +1540,24 @@ def refresh_access_token(refresh_token: str, user_doc_id: str | None = None):
         "Authorization": f"Basic {_basic_auth_header()}",
     }
 
-    res = requests.post("https://api.fitbit.com/oauth2/token", data=data, headers=headers)
+    try:
+        res = requests.post(
+            "https://api.fitbit.com/oauth2/token",
+            data=data,
+            headers=headers,
+            timeout=10,
+        )
+    except requests.exceptions.RequestException as e:
+        logger.error("Token refresh network error: %s", e)
+        return None
+
     if res.status_code == 200:
         token_data = res.json()
         if user_doc_id:
             save_tokens(token_data["access_token"], token_data["refresh_token"], user_doc_id)
         return token_data
 
-    logger.error("Token refresh failed: %s (response body suppressed)", res.status_code)
+    logger.error("Token refresh failed with status %s (response body suppressed)", res.status_code)
     return None
 
 
@@ -1573,7 +1671,8 @@ def callback():
         frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
         return redirect(f"{frontend_url}?fitbit=connected")
 
-    logger.error("Fitbit callback error: %s %s", res.status_code, res.text)
+    # Do not log res.text — it may contain sensitive auth details from Fitbit.
+    logger.error("Fitbit callback error: status %s (response body suppressed)", res.status_code)
     return jsonify({"error": "Fitbit authorization failed"}), 400
 
 
@@ -1669,6 +1768,24 @@ def chatbot():
         retrieved_chunks = []
         animations = []
         rag_error = str(e)
+
+    # -----------------------------------------------------------------------
+    # Animation topic-relevance filter.
+    # The ANIMATION_SURFACE_THRESHOLD (0.82) is intentionally lenient because
+    # script chunks embed in a different stylistic register than health
+    # questions.  That leniency can cause off-topic cards (e.g. a sleep
+    # animation surfacing mid Physical Activity MI intake) when the embedding
+    # overlap is marginal and domain-unrelated.  We drop any animation whose
+    # section title shares no meaningful keyword with the last 10 turns, which
+    # is a cheap text-level guard that doesn't require an extra embedding call.
+    # -----------------------------------------------------------------------
+    if animations:
+        animations = [
+            a for a in animations
+            if _animation_matches_conversation(
+                a.get("title", ""), history, user_message
+            )
+        ]
 
     # Geocode once — result feeds both weather and local time so we never
     # hit the geocoding API twice for the same request.
@@ -2205,7 +2322,6 @@ RESPONSE FORMAT:
         }
 
     return jsonify(response_data)
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
