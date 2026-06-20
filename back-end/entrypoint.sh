@@ -14,8 +14,8 @@
 # ---------------------------------------------------------------------------
 CHROMA_DIR="$(dirname "$0")/chroma_db"
 
-if [ ! -d "$CHROMA_DIR" ] || [ -z "$(ls -A "$CHROMA_DIR" 2>/dev/null)" ]; then
-    echo "chroma_db/ not found or empty — running initial document ingestion..."
+if [ "${FORCE_REINGEST:-0}" = "1" ] || [ ! -d "$CHROMA_DIR" ] || [ -z "$(ls -A "$CHROMA_DIR" 2>/dev/null)" ]; then
+    echo "chroma_db/ not found or empty (or FORCE_REINGEST=1) — running document ingestion..."
     python ingest.py
     echo "Ingestion complete."
 else
