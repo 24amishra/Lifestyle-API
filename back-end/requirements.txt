@@ -31,3 +31,7 @@ dnspython>=2.0
 gunicorn==21.2.0
 
 pandas
+
+# LLM response quality evals (dev/CI only)
+deepeval
+pytest
