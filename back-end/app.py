@@ -169,6 +169,62 @@ REFERENCE_INTENT_PATTERN = re.compile(
 )
 
 # ---------------------------------------------------------------------------
+# Crisis / self-harm detection.
+# This is a deterministic safety net that does NOT rely on the model
+# reliably following the single prompt sentence about crisis response.
+# When this pattern matches, the chatbot() handler (a) injects a hard
+# system instruction for this turn and (b) verifies after the fact that
+# the reply actually contains the 988 Lifeline and doesn't read like a
+# conversation-ending message, patching it if not.
+# Deliberately broad on intent phrases ("can't handle this anymore", "no
+# point", "hopeless") in addition to explicit self-harm language, since
+# cancer-survivorship crisis language is often indirect.
+# ---------------------------------------------------------------------------
+CRISIS_PATTERN = re.compile(
+    r"\b(suicide|suicidal|kill myself|end my life|ending my life|"
+    r"hurt(?:ing)? myself|harm(?:ing)? myself|self[\s-]harm|"
+    r"don'?t want to (?:be here|live|wake up)|want to die|wish i (?:was|were) dead|"
+    r"no (?:point|reason) (?:in|to) (?:living|going on|anymore)|"
+    r"can'?t (?:handle|do|take|deal with) this anymore|"
+    r"(?:feel|feeling) hopeless|give up on (?:life|everything))\b",
+    re.IGNORECASE,
+)
+
+CRISIS_SYSTEM_NOTE = (
+    "CRISIS LANGUAGE DETECTED THIS TURN — MANDATORY RESPONSE RULES:\n"
+    "The user's message matched crisis/self-harm language. This turn's reply MUST:\n"
+    "1. Lead with genuine empathy and warmth — acknowledge how hard this feels "
+    "before anything else.\n"
+    "2. Explicitly include the 988 Suicide and Crisis Lifeline (call or text 988) "
+    "AND encourage reaching out to their care team or a trusted person.\n"
+    "3. NOT pivot back to LE8 coaching, exercise, or scoring in this same reply — "
+    "no coaching questions, no 'would you like to focus on...' redirects.\n"
+    "4. NOT end the conversation. Close by staying present with them — e.g. invite "
+    "them to keep talking, ask how they're doing right now, or note you're here to "
+    "listen — never end on the crisis resources alone with nothing further offered.\n"
+    "5. NOT diagnose or make clinical judgments — just support, resources, and presence."
+)
+
+
+def _reply_looks_crisis_safe(reply: str) -> bool:
+    """
+    Cheap deterministic check that a crisis-flagged reply actually contains
+    the 988 Lifeline. Used as a safety net in case the model ignores
+    CRISIS_SYSTEM_NOTE.
+    """
+    if not reply:
+        return False
+    return "988" in reply
+
+
+CRISIS_FALLBACK_APPENDIX = (
+    "\n\nIf you're in crisis or having thoughts of harming yourself, please reach "
+    "out right now — call or text 988 (Suicide and Crisis Lifeline), or contact "
+    "your care team. You don't have to go through this alone, and I'm here to keep "
+    "talking with you whenever you're ready."
+)
+
+# ---------------------------------------------------------------------------
 # Exercise video library — loaded once at startup from Exercise Library.csv.
 #
 # Column name config: update EV_COL_* if the CSV uses different header names.
@@ -836,6 +892,167 @@ def _build_exercise_match_note(filters: dict, difficulty: str, fallback_level: i
         "4. You may add exercise tips from the health literature context \u2014 "
         "do not invent or cite anything not in that context.\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic LE8 value scoring.
+#
+# The LE8 score tiers/thresholds live in the system prompt as a reference
+# table for the model to use, but when a user states a raw value in chat
+# (e.g. "my HbA1c is 6.0%") the model was doing that arithmetic itself and
+# getting it wrong (misreading which tier a value falls in, ignoring a
+# self-reported diabetes diagnosis, etc). These helpers compute the score
+# in Python and the result is injected as an authoritative system note so
+# the model reports it rather than recalculating it.
+# ---------------------------------------------------------------------------
+
+_HBA1C_RE           = re.compile(r"hba1c[^%\d]{0,20}(\d{1,2}(?:\.\d+)?)\s*%?", re.IGNORECASE)
+_FASTING_GLUCOSE_RE = re.compile(r"fasting\s+gl?ucose[^%\d]{0,20}(\d{2,3}(?:\.\d+)?)", re.IGNORECASE)
+_NON_HDL_RE         = re.compile(r"non[\s-]?hdl[^%\d]{0,25}(\d{2,3}(?:\.\d+)?)", re.IGNORECASE)
+_CHOLESTEROL_SCORE_RE = re.compile(
+    r"cholesterol\s*(?:score)?\s*(?:is|of|=|:)?\s*(\d{1,3})\b", re.IGNORECASE
+)
+
+_DIABETES_POSITIVE_RE = re.compile(
+    r"\bi(?:'m| am)?\s*(?:a\s+)?diabetic\b|\bi\s+have\s+diabetes\b|"
+    r"\bdiagnosed with diabetes\b|\bmy diabetes\b",
+    re.IGNORECASE,
+)
+_DIABETES_NEGATIVE_RE = re.compile(
+    r"\bi\s*(?:don'?t|do not)\s*have\s+diabetes\b|\bnot\s+diabetic\b|\bno\s+diabetes\b",
+    re.IGNORECASE,
+)
+
+
+def _score_hba1c(value: float, has_diabetes: bool) -> int:
+    if has_diabetes:
+        if value < 7:  return 40
+        if value < 8:  return 30
+        if value < 9:  return 20
+        if value < 10: return 10
+        return 0
+    if value < 5.7: return 100
+    if value < 6.5: return 60
+    return 0
+
+
+def _score_fasting_glucose(value: float) -> int:
+    # The LE8 reference only defines a diabetic-specific scale for HbA1c,
+    # not fasting glucose — this is always the non-diabetic scale.
+    if value < 100: return 100
+    if value < 126: return 60
+    return 0
+
+
+def _score_non_hdl(value: float) -> int:
+    if value < 130: return 100
+    if value < 160: return 60
+    if value < 190: return 40
+    if value < 220: return 20
+    return 0
+
+
+def _non_hdl_range_for_score(score: int) -> str | None:
+    """Reverse-map an LE8 Blood Lipids score back to its mg/dL range, for
+    when a user quotes their score instead of the raw lab value."""
+    return {
+        100: "under 130 mg/dL",
+        60:  "130-159 mg/dL",
+        40:  "160-189 mg/dL",
+        20:  "190-219 mg/dL",
+        0:   "220 mg/dL or higher",
+    }.get(score)
+
+
+def _detect_diabetes_status(text_msgs: list) -> bool | None:
+    """
+    Scan a list of user message strings (oldest first) for a self-reported
+    diabetes diagnosis. The most recent explicit statement wins, so a later
+    correction overrides an earlier one. Returns None if never mentioned.
+    """
+    status = None
+    for text in text_msgs:
+        if _DIABETES_NEGATIVE_RE.search(text):
+            status = False
+        elif _DIABETES_POSITIVE_RE.search(text):
+            status = True
+    return status
+
+
+def _build_computed_value_note(user_message: str, history: list, le8_data: dict) -> str:
+    """
+    Extract any raw lab values / diabetes status the user has stated across
+    the conversation (including this turn) and return a system note with
+    the exact, pre-computed LE8 score for each — so the model reports a
+    number instead of recalculating it (and getting it wrong).
+    Returns "" if nothing relevant was found.
+    """
+    user_texts = [m["content"] for m in history if m.get("role") == "user"] + [user_message]
+    full_text  = " ".join(user_texts)
+
+    diabetes_status = _detect_diabetes_status(user_texts)
+    if diabetes_status is None:
+        bs_payload = ((le8_data or {}).get("metrics") or {}).get("blood_sugar") or {}
+        if isinstance(bs_payload, dict):
+            diabetes_status = bs_payload.get("has_diabetes")
+
+    lines = []
+
+    m = _HBA1C_RE.search(full_text)
+    if m:
+        value   = float(m.group(1))
+        has_d   = bool(diabetes_status)
+        score   = _score_hba1c(value, has_d)
+        tier    = _le8_tier(score)
+        scale   = "the diabetic scale (40-pt max)" if has_d else "the non-diabetic scale"
+        lines.append(
+            f"COMPUTED VALUE — the user's HbA1c is {value}%. Using {scale}, this scores "
+            f"EXACTLY {score}/100 ({tier} tier). Report this score and tier precisely; do not "
+            f"recalculate it yourself. Do NOT tell the user whether they 'have' or 'don't have' "
+            f"diabetes based on this number — that diagnosis belongs to their doctor, only report "
+            f"how the app scores the value they gave you."
+            + ("" if has_d else " If the user has told you (in this conversation) that they have "
+               "a diabetes diagnosis, you MUST use the diabetic scale instead — do not silently "
+               "re-evaluate them against the non-diabetic thresholds or contradict their "
+               "self-reported diagnosis.")
+        )
+
+    m = _FASTING_GLUCOSE_RE.search(full_text)
+    if m:
+        value = float(m.group(1))
+        score = _score_fasting_glucose(value)
+        tier  = _le8_tier(score)
+        lines.append(
+            f"COMPUTED VALUE — the user's fasting glucose is {value} mg/dL. This scores "
+            f"EXACTLY {score}/100 ({tier} tier). Report this precisely; do not recalculate it."
+        )
+
+    m = _NON_HDL_RE.search(full_text)
+    if m:
+        value = float(m.group(1))
+        score = _score_non_hdl(value)
+        tier  = _le8_tier(score)
+        lines.append(
+            f"COMPUTED VALUE — the user's non-HDL cholesterol is {value} mg/dL. This scores "
+            f"EXACTLY {score}/100 ({tier} tier). Report this precisely; do not recalculate it."
+        )
+    else:
+        m = _CHOLESTEROL_SCORE_RE.search(user_message)
+        if m:
+            score      = int(m.group(1))
+            range_str  = _non_hdl_range_for_score(score)
+            if range_str:
+                tier = _le8_tier(score)
+                lines.append(
+                    f"COMPUTED VALUE — the user says their LE8 Blood Lipids score is {score}/100 "
+                    f"({tier} tier). That corresponds to a non-HDL cholesterol of {range_str}. "
+                    f"State this range. Do NOT tell them whether it is 'dangerous' — that is a "
+                    f"clinical judgment for their care team. Do note it's worth discussing with "
+                    f"their care team, and suggest lifestyle levers (soluble fiber, unsaturated "
+                    f"fats, reduced saturated fat, physical activity) that can help move it."
+                )
+
+    return "\n\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1508,11 +1725,20 @@ def save_tokens(access_token: str, refresh_token: str, user_id: str | None = Non
 
 
 def load_tokens(user_id: str | None = None):
+    """
+    Look up stored Fitbit tokens for a specific user document.
+
+    SECURITY: user_id is required. There is intentionally no "most recently
+    updated document" fallback here — this is a multi-tenant collection, so
+    guessing at a document when no user_id is supplied would return whichever
+    OTHER user connected Fitbit most recently, leaking their access/refresh
+    tokens (and therefore their activity/sleep/heart-rate data) to the
+    current caller. Every call site must resolve an actual user_id first.
+    """
+    if not user_id:
+        return None, None, None
     try:
-        if user_id:
-            document = collection.find_one({"_id": ObjectId(user_id)})
-        else:
-            document = collection.find_one(sort=[("updated_at", -1)])
+        document = collection.find_one({"_id": ObjectId(user_id)})
 
         if document:
             return (
@@ -1627,6 +1853,15 @@ def authorize():
     code_challenge = _pkce_code_challenge(code_verifier)
     session["code_verifier"] = code_verifier
 
+    # CSRF defense-in-depth: PKCE alone binds the auth code to whichever
+    # session holds the matching code_verifier, but an explicit `state`
+    # value is the standard OAuth CSRF control and protects against
+    # implementation edge cases (e.g. a shared/reused session) where PKCE
+    # binding isn't sufficient on its own. Store it server-side and verify
+    # it round-trips unchanged in /callback.
+    oauth_state = secrets.token_urlsafe(24)
+    session["oauth_state"] = oauth_state
+
     params = {
         "response_type": "code",
         "client_id": FITBIT_CLIENT_ID,
@@ -1634,6 +1869,7 @@ def authorize():
         "scope": "activity heartrate sleep profile",
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
+        "state": oauth_state,
     }
     return redirect(f"https://www.fitbit.com/oauth2/authorize?{urlencode(params)}")
 
@@ -1646,6 +1882,12 @@ def callback():
     code = request.args.get("code")
     if not code:
         return jsonify({"error": "Missing authorization code"}), 400
+
+    expected_state = session.pop("oauth_state", None)
+    returned_state = request.args.get("state")
+    if not expected_state or not secrets.compare_digest(expected_state, returned_state or ""):
+        logger.warning("Fitbit callback: state mismatch (possible CSRF attempt)")
+        return jsonify({"error": "Invalid or expired authorization state. Please restart the authorization flow."}), 400
 
     code_verifier = session.get("code_verifier")
     if not code_verifier:
@@ -1706,10 +1948,14 @@ def chatbot():
         raw_history = []
     history = sanitize_history(raw_history)
 
-    raw_city = body.get("city", "Columbus")
+    raw_city = body.get("city", "")
     if not isinstance(raw_city, str):
-        raw_city = "Columbus"
-    city = sanitize_city(raw_city) or "Columbus"
+        raw_city = ""
+    # No silent "Columbus" fallback: an unset/blank/invalid city must stay
+    # None so downstream logic (weather, geocoding-failure messaging, the
+    # system prompt) can tell "user never gave us a city" apart from an
+    # actual request about Columbus.
+    city = sanitize_city(raw_city)
 
     # -----------------------------------------------------------------------
     # LE8 data
@@ -1726,6 +1972,14 @@ def chatbot():
 
     # Detect whether the user is explicitly asking for research sources
     include_references = bool(REFERENCE_INTENT_PATTERN.search(user_message))
+
+    # Deterministic crisis/self-harm detection — see CRISIS_PATTERN comment.
+    is_crisis = bool(CRISIS_PATTERN.search(user_message))
+
+    # Deterministic LE8 value scoring for anything the user stated in chat
+    # (raw HbA1c/fasting glucose/non-HDL values or a quoted score) — see
+    # _build_computed_value_note.
+    computed_value_note = _build_computed_value_note(user_message, history, le8_data)
 
     # ---------------------------------------------------------------------------
     # Exercise video matching (runs before the LLM call so the match note can
@@ -1789,12 +2043,20 @@ def chatbot():
 
     # Geocode once — result feeds both weather and local time so we never
     # hit the geocoding API twice for the same request.
-    city_info = _geocode_city(city)
-    weather = get_weather(city, city_info=city_info)
+    if city:
+        city_info = _geocode_city(city)
+        weather = get_weather(city, city_info=city_info)
+    else:
+        # No city provided (or an invalid one that failed sanitization) —
+        # do NOT silently default to Columbus. Tell the model plainly so it
+        # can ask the user for a city or give city-agnostic guidance instead
+        # of fabricating/assuming a location.
+        city_info = None
+        weather = "Weather data unavailable (no city provided yet)"
     if city_info:
         time_str = get_local_time(city_info[2])
     else:
-        # Geocoding failed; fall back to UTC
+        # Geocoding failed, or no city provided; fall back to UTC
         time_str = datetime.datetime.now(datetime.timezone.utc).strftime("%I:%M %p UTC").lstrip("0")
 
     fitbit_section = ""
@@ -1853,6 +2115,10 @@ YOUR ROLE:
 LE8 SCORING REFERENCE
 Use this section authoritatively for all score explanations and level-up guidance.
 This does NOT require RAG support — the thresholds below are the source of truth.
+If a "COMPUTED VALUE" system note appears later in this conversation for this turn,
+that note has already done the lookup against these thresholds for a value the user
+stated in chat — use its exact score/tier verbatim instead of recalculating it
+yourself from the raw value.
 
 Score tiers: 0-49 = Low | 50-79 = Intermediate | 80-100 = Ideal
 Composite = average of all metrics that have data (missing metrics are excluded).
@@ -1929,6 +2195,26 @@ BEHAVIOR GUIDELINES:
   Example: "Great question — [brief answer]. Getting back to your goal —
   I still need to ask about [next field]."
 
+CONNECTING FITBIT:
+- If asked how to connect Fitbit, describe the real in-app flow: they click
+  "Connect Fitbit" (or open the Fitbit connection option) in the app, which
+  sends them to Fitbit's own authorization page. Once they approve access
+  there (to activity, heart rate, sleep, and profile data), Fitbit redirects
+  them back and the app is connected automatically — no extra setup needed.
+- Do NOT say you're unable to help with app connectivity or redirect to a
+  generic "help section" — this exact flow exists and you can describe it.
+
+EXERCISE VIDEO LINKS:
+- Video cards are surfaced automatically by the system alongside your reply
+  (see EXERCISE VIDEO PROTOCOL below) — you do not send raw links yourself,
+  but the app genuinely does show real Vimeo video cards. Don't deny that the
+  app sends video links; only clarify that you personally don't paste URLs.
+- If a user reports that a video link/card isn't working or the video was
+  removed, do not insist the same link should still work. Acknowledge it may
+  no longer be available, apologize briefly, and offer to surface a different
+  matching video instead (re-run the EXERCISE VIDEO PROTOCOL matching with
+  their existing preferences).
+
 KNOWLEDGE BOUNDARY:
 - LE8 score explanations and level-up guidance: use the LE8 SCORING REFERENCE
   above — this is authoritative and does not require RAG support.
@@ -1949,6 +2235,16 @@ Use time and weather together when recommending outdoor exercise.
 - Severe conditions (rain, below 50F, above 90F, high wind): suggest indoor alternatives.
 - If the user explicitly wants to go outside, respect that — briefly note conditions
   but do not override their choice.
+- If weather says "no city provided yet": you do NOT know the user's location —
+  do not assume Columbus or any other city. If the user asks about weather
+  specifically, tell them you need a city name to check conditions. Otherwise,
+  just give city-agnostic activity guidance without mentioning the missing city
+  as a technical failure. A missing/unknown city must never block or skip the
+  exercise-preference (EV1-EV4) questions — those are independent of location.
+- If weather says "could not locate '<city>'": geocoding failed for the name
+  the user gave — say plainly that you couldn't find that location and ask them
+  to double check the spelling or try a nearby larger city. Do not invent a
+  forecast for a place that doesn't resolve.
 {le8_section}{fitbit_section}
 CONTEXT FROM HEALTH LITERATURE:
 {context}
@@ -1958,7 +2254,13 @@ SMART GOAL PROTOCOL — MOTIVATIONAL INTERVIEWING INTAKE:
 When a user expresses interest in making a change — any phrasing like
 "I want to be more active", "I should eat better", "I need to work on
 my sleep", "I want to quit smoking", or any other improvement intention
-— you enter SMART Goal Mode for that domain.
+— you enter SMART Goal Mode for that domain. This also includes explicit
+requests that name "SMART goal(s)" directly, e.g. "give video about SMART
+goals", "help me set a SMART goal", "make me a SMART goal" — these always
+start SMART Goal Mode at [U1] (confirm the domain), even if the word
+"video" is also present. Never treat the word "video" alone as redirecting
+this into the exercise-video flow instead — see EXERCISE VIDEO PROTOCOL
+rule 4 below for how the two interact.
 
 SMART Goal Mode has two phases: INTAKE and SYNTHESIS.
 
@@ -2164,6 +2466,14 @@ WHEN TO ASK THE PREFERENCE QUESTIONS:
    workout", "show me something different", or "give me another one",
    treat these as requests to surface more videos with current preferences
    and surface immediately — do NOT ask "what kind?" or restart [EV1].
+4. PRIORITY RULE — the word "video"/"videos" appearing in a message does NOT
+   automatically mean [EV1]. If the message explicitly names "SMART goal(s)"
+   (e.g. "give video about SMART goals", "make me a SMART goal video", "show
+   me a SMART goal"), treat this as a request to start the SMART GOAL PROTOCOL
+   at [U1] — confirm the LE8 domain first. Do not reinterpret it as a direct
+   exercise-video request just because "video" appears in the sentence. You
+   will only reach [EV1] later, once inside PA SMART Goal intake and after
+   [PA1]-[PA4] are complete, per rule 1 above.
 
 THE 4 PREFERENCE QUESTIONS \u2014 ask exactly one per turn in this order:
 
@@ -2254,35 +2564,48 @@ RESPONSE FORMAT:
     # user's turn — maximum recency ensures the model acts on it.
     if exercise_match_note:
         messages.append({"role": "system", "content": exercise_match_note})
+    if computed_value_note:
+        messages.append({"role": "system", "content": computed_value_note})
+    # Crisis note goes last (highest recency / priority) so it overrides
+    # any in-progress SMART Goal / exercise-video flow for this turn.
+    if is_crisis:
+        messages.append({"role": "system", "content": CRISIS_SYSTEM_NOTE})
     messages.append({"role": "user", "content": user_message})
 
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.5",
             messages=messages,
             max_tokens=600,
             temperature=0.4,
         )
         reply = response.choices[0].message.content
     except Exception as e:
-        # If gpt-4o-mini is rate-limited (429), fall back to gpt-3.5-turbo
-        # which has a separate daily quota bucket.
+        # If gpt-5.5 is rate-limited (429), fall back to gpt-4o, which has
+        # a separate daily quota bucket.
         if isinstance(e, RateLimitError):
-            logger.warning("gpt-4o-mini rate limited, falling back to gpt-3.5-turbo: %s", e)
+            logger.warning("gpt-5.5 rate limited, falling back to gpt-4o: %s", e)
             try:
                 response = openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo",
+                    model="gpt-4o",
                     messages=messages,
                     max_tokens=600,
                     temperature=0.4,
                 )
                 reply = response.choices[0].message.content
             except Exception as fallback_e:
-                logger.error("gpt-3.5-turbo fallback also failed: %s", fallback_e)
+                logger.error("gpt-4o fallback also failed: %s", fallback_e)
                 return jsonify({"error": "AI call failed"}), 500
         else:
             logger.error("OpenAI call failed: %s", e)
             return jsonify({"error": "AI call failed"}), 500
+
+    # Safety net: if this turn was flagged as crisis language but the model's
+    # reply doesn't actually contain the 988 Lifeline (ignored the mandatory
+    # instruction), patch it in rather than letting the resource go missing.
+    if is_crisis and not _reply_looks_crisis_safe(reply):
+        logger.warning("Crisis turn missing 988 Lifeline in model reply — appending fallback.")
+        reply = (reply or "").rstrip() + CRISIS_FALLBACK_APPENDIX
 
     # Return the FULL history (not truncated) so the frontend accumulates the
     # complete conversation. Filter detection (_detect_exercise_filters) and the

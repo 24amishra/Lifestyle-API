@@ -7,14 +7,22 @@ requests
 
 # AI/ML
 openai
-langchain-openai
+langchain-openai<1.0
 
 # Vector database (for RAG)
 chromadb
 
 # Text splitting
 langchain-text-splitters
-langchain-community
+# Pinned <1.0: langchain-community>=0.4 dropped the vertexai chat-model
+# shim that ragas 0.4.x still imports unconditionally, which breaks
+# `import ragas` with ModuleNotFoundError. Neither app.py nor ingest.py
+# import langchain-community directly, so this pin only affects the
+# ragas/eval toolchain. Keep in sync with langchain-core/langchain-openai
+# pins below if you ever bump ragas.
+langchain-community<1.0
+langchain-core<1.0,>=0.3.66
+langchain<1.0
 
 # PDF reading (for ingesting literature)
 pypdf
@@ -35,3 +43,5 @@ pandas
 # LLM response quality evals (dev/CI only)
 deepeval
 pytest
+ragas
+datasets
