@@ -1591,9 +1591,17 @@ def retrieve_context(
 
 def _geocode_city(city: str) -> tuple | None:
     """
-    Resolve a city name to (latitude, longitude, iana_timezone).
-    The IANA timezone string (e.g. 'America/Chicago') comes free from
-    Open-Meteo's geocoding response and is used to compute local time.
+    Resolve a city name to (latitude, longitude, iana_timezone, display_name).
+
+    display_name is the actual place Open-Meteo matched (e.g.
+    "Legend, Alberta, Canada"), which is NOT necessarily what the user typed.
+    Open-Meteo's search is a fuzzy/substring match against a global gazetteer
+    with count=1 (top match only, no relevance score returned) — an unusual
+    or made-up input can still return some obscure "best guess" locality with
+    no signal that it's a poor match. We surface display_name so the system
+    prompt can have the model state the resolved location back to the user
+    instead of silently treating a low-confidence match as ground truth for
+    their weather/local time.
     """
     try:
         res = requests.get(
@@ -1607,7 +1615,10 @@ def _geocode_city(city: str) -> tuple | None:
         if results:
             r = results[0]
             tz_str = r.get("timezone", "UTC")
-            return r["latitude"], r["longitude"], tz_str
+            name_parts = [p for p in (r.get("name"), r.get("admin1"), r.get("country")) if p]
+            # dict.fromkeys dedupes while preserving order (e.g. name == country edge case)
+            display_name = ", ".join(dict.fromkeys(name_parts)) or city
+            return r["latitude"], r["longitude"], tz_str, display_name
         return None
     except Exception as e:
         logger.warning("Geocoding failed for '%s': %s", city, e)
@@ -1632,16 +1643,16 @@ def get_local_time(tz_str: str) -> str:
 def get_weather(city: str = "Columbus", city_info=None) -> str:
     """
     Fetch NWS weather for a city. Accepts a pre-resolved city_info tuple
-    (lat, lon, tz_str) from _geocode_city to avoid a redundant geocoding
-    call when the caller already has it.
+    (lat, lon, tz_str, display_name) from _geocode_city to avoid a redundant
+    geocoding call when the caller already has it.
     """
     if city_info is not None:
-        lat, lon, _ = city_info
+        lat, lon, _, display_name = city_info
     else:
         city_info = _geocode_city(city)
         if city_info is None:
             return f"Weather data unavailable (could not locate '{city}')"
-        lat, lon, _ = city_info
+        lat, lon, _, display_name = city_info
     nws_headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
 
     try:
@@ -1667,7 +1678,7 @@ def get_weather(city: str = "Columbus", city_info=None) -> str:
         wind_dir  = _sanitize_prompt_str(str(current.get("windDirection",    "")), 20)
         wind_spd  = _sanitize_prompt_str(str(current.get("windSpeed",        "")), 20)
         return (
-            f"{city}: {temp}\u00b0{temp_unit}, "
+            f"{display_name}: {temp}\u00b0{temp_unit}, "
             f"{forecast}, "
             f"wind {wind_dir} {wind_spd}"
         )
@@ -2055,9 +2066,16 @@ def chatbot():
         weather = "Weather data unavailable (no city provided yet)"
     if city_info:
         time_str = get_local_time(city_info[2])
+        resolved_location_line = (
+            f"Resolved location: the city field \"{city}\" was matched to "
+            f"{city_info[3]} (this is a single best-guess fuzzy match against "
+            f"a global place database, not a verified address) — see the "
+            f"LOCATION CONFIRMATION rule below.\n"
+        )
     else:
         # Geocoding failed, or no city provided; fall back to UTC
         time_str = datetime.datetime.now(datetime.timezone.utc).strftime("%I:%M %p UTC").lstrip("0")
+        resolved_location_line = ""
 
     fitbit_section = ""
     fitbit_data = None
@@ -2230,7 +2248,7 @@ KNOWLEDGE BOUNDARY:
 CURRENT WEATHER & TIME:
 Time: {time_str}
 {weather}
-Use time and weather together when recommending outdoor exercise.
+{resolved_location_line}Use time and weather together when recommending outdoor exercise.
 - Between 9 PM and 6 AM: suggest indoor or rest-based options.
 - Severe conditions (rain, below 50F, above 90F, high wind): suggest indoor alternatives.
 - If the user explicitly wants to go outside, respect that — briefly note conditions
@@ -2241,10 +2259,51 @@ Use time and weather together when recommending outdoor exercise.
   just give city-agnostic activity guidance without mentioning the missing city
   as a technical failure. A missing/unknown city must never block or skip the
   exercise-preference (EV1-EV4) questions — those are independent of location.
+  In this case, Time above is a UTC fallback, NOT the user's local time —
+  see the UTC rule below.
 - If weather says "could not locate '<city>'": geocoding failed for the name
   the user gave — say plainly that you couldn't find that location and ask them
   to double check the spelling or try a nearby larger city. Do not invent a
-  forecast for a place that doesn't resolve.
+  forecast for a place that doesn't resolve. In this case, Time above is also
+  a UTC fallback, NOT the user's local time — see the UTC rule below.
+- UTC RULE: whenever the Time value above literally contains "UTC" (e.g.
+  "3:25 AM UTC"), that means we could not determine the user's local time
+  zone (no city, or a city that failed to resolve) — it is NOT their local
+  time. You MUST say so explicitly if you reference the time at all, e.g.
+  "I don't know your local time zone, so going off UTC time (currently
+  3:25 AM UTC) as a rough guide..." Never drop the "UTC" qualifier and
+  present it as if it were the user's own local time.
+- If weather says "NWS only covers US locations": the city WAS found (Time
+  above is their real local time — use it confidently) but live conditions
+  aren't available because this app's weather source only covers the US.
+  Say plainly that you don't have live weather for that location, then give
+  activity guidance based on time of day alone (and season/latitude if
+  relevant). Do not hedge as if the city itself is unknown, and do not
+  fabricate a forecast.
+- If weather is exactly "Weather data unavailable" with no other detail:
+  this is a transient fetch error (the city is known, Time above is still
+  accurate) — briefly note you can't pull current conditions right now and
+  proceed with time-based guidance. Do not fabricate a forecast.
+- LOCATION CONFIRMATION: when a "Resolved location" line appears above, the
+  city field was matched to a specific place by a fuzzy search — it may be
+  an obscure or wrong match for whatever the user actually meant (e.g. a
+  test/fake entry, a nickname, or a city that shares a name with a much
+  smaller/less-likely place). The first time you reference weather, time,
+  or location in a NEW conversation (or right after the city changes),
+  briefly state the resolved place back to the user in passing so they can
+  correct it if it's wrong — e.g. "I've got you in Chicago, Illinois" or,
+  for an unusual/low-confidence-looking match, be more explicit: "I found
+  'Legend' as a small locality in [wherever it resolved to] — if that's not
+  where you are, update the city field at the top of the app with your
+  actual city." Use your judgment: a common, unambiguous city name doesn't
+  need a heavy caveat, but anything that looks like it could be a poor or
+  surprising match should be flagged plainly rather than presented as
+  settled fact. IMPORTANT: the city comes from a separate text field in the
+  app UI, NOT from anything typed in this chat — saying it in the
+  conversation has no effect. Never phrase this as "let me know your city"
+  or "tell me your city" as if replying in chat would fix it; always direct
+  the user to update the city field itself. Do not repeat this confirmation
+  every turn once you've already stated it earlier in the conversation.
 {le8_section}{fitbit_section}
 CONTEXT FROM HEALTH LITERATURE:
 {context}
@@ -2572,7 +2631,7 @@ RESPONSE FORMAT:
         messages.append({"role": "system", "content": CRISIS_SYSTEM_NOTE})
     messages.append({"role": "user", "content": user_message})
 
-    try:
+    def _call_gpt55():
         response = openai_client.chat.completions.create(
             model="gpt-5.5",
             messages=messages,
@@ -2580,26 +2639,59 @@ RESPONSE FORMAT:
             # `max_tokens` param with a 400 invalid_request_error and require
             # `max_completion_tokens` instead. This also works fine on gpt-4o,
             # so both the primary and fallback calls use it.
-            max_completion_tokens=600,
+            #
+            # gpt-5.5 is a reasoning-tier model: hidden reasoning tokens are
+            # deducted from this same budget before any visible answer is
+            # produced. At 600 this occasionally left zero tokens for the
+            # actual reply on harder turns (e.g. a medical-scoring question
+            # with extra injected system notes) — the API call succeeds with
+            # finish_reason="length" and empty content, which the frontend
+            # then shows as "Something went wrong" even though nothing
+            # actually errored. Sized up with real headroom for reasoning +
+            # a full ~600-token visible answer.
+            max_completion_tokens=2000,
             # gpt-5.5 also rejects any non-default `temperature` value (only
             # the default of 1 is accepted) — omit it here. gpt-4o below
             # still supports custom temperature, so that call keeps 0.4 for
             # the steadier, less-random tone the fallback is expected to have.
         )
-        reply = response.choices[0].message.content
+        return response.choices[0].message.content, getattr(response.choices[0], "finish_reason", None)
+
+    def _call_gpt4o():
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            max_completion_tokens=800,
+            temperature=0.4,
+        )
+        return response.choices[0].message.content, getattr(response.choices[0], "finish_reason", None)
+
+    try:
+        reply, finish_reason = _call_gpt55()
+        # Safety net: the call can succeed (200) but return empty content —
+        # e.g. gpt-5.5 exhausting its token budget on hidden reasoning with
+        # nothing left for the visible answer (finish_reason "length" with
+        # blank content). Treat that the same as a real failure and retry
+        # once on gpt-4o rather than silently returning an empty reply.
+        if not (reply or "").strip():
+            logger.warning(
+                "gpt-5.5 returned empty content (finish_reason=%s), falling back to gpt-4o",
+                finish_reason,
+            )
+            reply, _ = _call_gpt4o()
+            if not (reply or "").strip():
+                logger.error("gpt-4o fallback also returned empty content")
+                return jsonify({"error": "AI call failed"}), 500
     except Exception as e:
         # If gpt-5.5 is rate-limited (429), fall back to gpt-4o, which has
         # a separate daily quota bucket.
         if isinstance(e, RateLimitError):
             logger.warning("gpt-5.5 rate limited, falling back to gpt-4o: %s", e)
             try:
-                response = openai_client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=messages,
-                    max_completion_tokens=600,
-                    temperature=0.4,
-                )
-                reply = response.choices[0].message.content
+                reply, _ = _call_gpt4o()
+                if not (reply or "").strip():
+                    logger.error("gpt-4o fallback returned empty content")
+                    return jsonify({"error": "AI call failed"}), 500
             except Exception as fallback_e:
                 logger.error("gpt-4o fallback also failed: %s", fallback_e)
                 return jsonify({"error": "AI call failed"}), 500
