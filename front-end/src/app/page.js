@@ -190,7 +190,9 @@ export default function Home() {
   const [history, setHistory] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [city, setCity] = useState("Columbus");
+  // No default city: an untouched field must reach the backend as "no city
+  // provided" (empty string), not silently claim the user is in Columbus.
+  const [city, setCity] = useState("");
   const [fitbitConnected, setFitbitConnected] = useState(false);
   const [showChunks, setShowChunks] = useState(false);
   const [chunksByMessage, setChunksByMessage] = useState({});
@@ -323,7 +325,7 @@ export default function Home() {
             className="text-sm border rounded px-2 py-1 w-32 text-gray-600"
             value={city}
             onChange={(e) => setCity(e.target.value)}
-            placeholder="City for weather"
+            placeholder="City for weather (optional)"
             maxLength={100}
           />
           <button

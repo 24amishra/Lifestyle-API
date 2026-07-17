@@ -1,6 +1,6 @@
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
 
 __pycache__/
 *.py[cod]
@@ -13,6 +13,8 @@ venv/
 back-end/chroma_db/
 back-end/.deepeval/
 .deepeval_telemetry.txt
+.pytest_cache/
+back-end/.pytest_cache/
 
 node_modules/
 front-end/node_modules/
@@ -29,7 +31,28 @@ Thumbs.db
 
 tokens.json
 
-package-lock.json
-
 dist/
 build/
+
+# ---------------------------------------------------------------------------
+# Third-party / copyrighted source literature.
+# back-end/documents/ holds published journal articles, patient guides, and
+# other third-party PDFs used only as local RAG source material for
+# ingest.py. These are not ours to redistribute via git history — keep them
+# out of the repo and provision them separately at deploy time (e.g. a
+# private bucket or volume). ingest.py reads them from disk; nothing else
+# depends on them being version-controlled.
+# ---------------------------------------------------------------------------
+back-end/documents/
+
+# ---------------------------------------------------------------------------
+# Eval outputs derived from the above documents.
+# DeepEval's Synthesizer generates goldens *from* back-end/documents/*.pdf,
+# and the RAGAS runner's result CSVs embed verbatim retrieved_context chunks
+# pulled from those same PDFs — both can carry copyrighted excerpts and are
+# regeneratable, so neither belongs in git.
+# ---------------------------------------------------------------------------
+back-end/evals/**/generated/
+back-end/evals/**/results/
+back-end/evals/**/*.cache/
+.ragas_cache/
