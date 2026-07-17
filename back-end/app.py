@@ -2581,7 +2581,10 @@ RESPONSE FORMAT:
             # `max_completion_tokens` instead. This also works fine on gpt-4o,
             # so both the primary and fallback calls use it.
             max_completion_tokens=600,
-            temperature=0.4,
+            # gpt-5.5 also rejects any non-default `temperature` value (only
+            # the default of 1 is accepted) — omit it here. gpt-4o below
+            # still supports custom temperature, so that call keeps 0.4 for
+            # the steadier, less-random tone the fallback is expected to have.
         )
         reply = response.choices[0].message.content
     except Exception as e:
