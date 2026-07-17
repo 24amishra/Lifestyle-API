@@ -2576,7 +2576,11 @@ RESPONSE FORMAT:
         response = openai_client.chat.completions.create(
             model="gpt-5.5",
             messages=messages,
-            max_tokens=600,
+            # Current-generation models (gpt-5.5 included) reject the legacy
+            # `max_tokens` param with a 400 invalid_request_error and require
+            # `max_completion_tokens` instead. This also works fine on gpt-4o,
+            # so both the primary and fallback calls use it.
+            max_completion_tokens=600,
             temperature=0.4,
         )
         reply = response.choices[0].message.content
@@ -2589,7 +2593,7 @@ RESPONSE FORMAT:
                 response = openai_client.chat.completions.create(
                     model="gpt-4o",
                     messages=messages,
-                    max_tokens=600,
+                    max_completion_tokens=600,
                     temperature=0.4,
                 )
                 reply = response.choices[0].message.content
