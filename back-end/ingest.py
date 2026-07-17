@@ -365,4 +365,41 @@ collection.add(
     ids=all_ids,
 )
 
+# ---------------------------------------------------------------------------
+# Re-apply animation_overrides.json automatically.
+#
+# ingest.py deletes and rebuilds the "health_docs" collection from scratch
+# on every run (see delete_collection() above), which means any patches
+# previously applied by apply_overrides.py — overrides that only ever lived
+# in ChromaDB, not in the source PDFs — get silently wiped. Previously this
+# required remembering to manually re-run apply_overrides.py afterward, with
+# nothing enforcing it; editing a PDF and re-ingesting would quietly regress
+# animation links back to whatever the raw transcript text contains. Running
+# it automatically here closes that gap.
+# ---------------------------------------------------------------------------
+print("\nRe-applying animation_overrides.json (if present)…")
+try:
+    import apply_overrides as _apply_overrides_mod
+
+    if os.path.exists(_apply_overrides_mod.OVERRIDES_FILE):
+        _overrides = _apply_overrides_mod.load_overrides()
+        if _overrides:
+            _stored_titles = _apply_overrides_mod.all_section_titles(collection)
+            _all_applied = _apply_overrides_mod.apply_overrides(
+                _overrides, collection, _stored_titles
+            )
+            if not _all_applied:
+                print(
+                    "WARNING: one or more animation overrides did not match "
+                    "any section in the freshly-ingested collection. Run "
+                    "`python apply_overrides.py --list` to inspect current "
+                    "section titles and fix animation_overrides.json."
+                )
+        else:
+            print("  No non-blank overrides to apply.")
+    else:
+        print(f"  {_apply_overrides_mod.OVERRIDES_FILE} not found — skipping.")
+except Exception as e:
+    print(f"WARNING: failed to auto-apply animation_overrides.json: {e}")
+
 print(f"\nDone! {len(all_chunks)} chunks saved to chroma_db/")

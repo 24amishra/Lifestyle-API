@@ -280,13 +280,44 @@ def _safe_numeric(value, default: str = "N/A") -> str:
 # Exercise video helpers
 # ---------------------------------------------------------------------------
 
-def _parse_exercise_title(title: str) -> dict:
+def _clean_exercise_title(title: str) -> str:
+    """
+    Normalize a raw CSV title for display to the user.
+
+    The source CSV has several data-quality issues: a botched em-dash export
+    that shows up as the Unicode replacement character (U+FFFD, "�") in some
+    rows, and an inconsistent "Workout"–"With" separator across rows (some use
+    "�", some " - ", some "- ", most use "--"). None of that is meaningful to
+    the matching logic, but it looks broken if shown to the user as-is, so we
+    normalize every variant to a single en dash with spaces around it.
+    """
+    if not title:
+        return title
+    # Replace the mojibake replacement character and any run of hyphens used
+    # as a separator with a consistent " – " (en dash).
+    cleaned = title.replace("�", " – ")
+    cleaned = re.sub(r"\s*-{1,2}\s*(?=With\b)", " – ", cleaned)
+    # Collapse any accidental doubled/triple spaces created above.
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def _parse_exercise_title(title: str, category: str = "") -> dict:
     """
     Extract duration_minutes, format (Seated/Standing/Mix), and body_part
     from a video title string.
 
     Titles follow the pattern:
       "12 Minute Intermediate Bodyweight Lower Body Workout – With Rita (Bodyweight-Standing)"
+
+    Some rows (all current Yoga/Tai Chi rows) omit the trailing
+    "(Category-Position)" parenthetical entirely and never mention
+    seated/standing/mix anywhere in the title, so the primary text-matching
+    pass below can't determine a format for them. For those we fall back to
+    a category-based default: "Chair Yoga" is inherently seated, and plain
+    "Tai Chi"/"Yoga" workouts in this library are performed standing unless
+    the title says otherwise. This keeps the seated/standing filter accurate
+    instead of silently treating the whole category as "matches anything."
     """
     # Duration: "12 Minute", "15-Minute", "30 Min"
     dur_match = re.search(r"(\d+)\s*[-\s]?[Mm]in(?:ute)?", title)
@@ -295,7 +326,7 @@ def _parse_exercise_title(title: str) -> dict:
     # Format: prefer the parenthetical at the end, e.g. "(Bodyweight-Standing)"
     paren_match = re.search(r"\(([^)]+)\)", title)
     search_text = paren_match.group(1).lower() if paren_match else title.lower()
-    if "seated" in search_text:
+    if "seated" in search_text or "chair" in search_text:
         fmt = "Seated"
     elif "standing" in search_text:
         fmt = "Standing"
@@ -303,6 +334,16 @@ def _parse_exercise_title(title: str) -> dict:
         fmt = "Mix"
     else:
         fmt = None
+
+    if fmt is None:
+        # Category-based fallback for rows with no format signal anywhere
+        # in the title (see docstring above).
+        cat_lower = (category or "").lower()
+        tl_for_fallback = title.lower()
+        if "chair" in tl_for_fallback or cat_lower == "chair yoga":
+            fmt = "Seated"
+        elif cat_lower == "tai chi":
+            fmt = "Standing"
 
     # Body part
     tl = title.lower()
@@ -433,14 +474,52 @@ def _load_exercise_videos() -> list:
         return []
 
     videos = []
+    # Guard against true duplicate rows — same Vimeo link listed twice (e.g.
+    # from a copy-paste error in the spreadsheet). Deliberately keyed on the
+    # LINK, not the title: the CSV has at least one pair of rows that share
+    # identical title text but point to two different, distinct Vimeo videos
+    # (two separate recordings of the same workout name). Deduping by title
+    # would silently throw away one of those two genuinely different, working
+    # videos — the user asked us to keep every video link, even broken ones,
+    # so only exact link duplicates (the same video counted twice) are
+    # dropped here.
+    seen_links: set = set()
+    # Track how many times each cleaned title has been seen so identical-title
+    # different-video rows get a "(2)", "(3)", ... suffix instead of showing
+    # up as indistinguishable cards with no way to tell them apart.
+    title_counts: dict = {}
     for _, row in df.iterrows():
         link = str(row[col_map["link"]]).strip()
         if not link or link.lower() in ("nan", "none", "") or not link.startswith("https://"):
             continue
-        title      = str(row[col_map["title"]]).strip()
+
+        link_key = link.strip().lower()
+        if link_key in seen_links:
+            logger.warning(
+                "Exercise Library.csv: skipping row with duplicate Vimeo link %r "
+                "— already loaded from an earlier row.",
+                link[:60],
+            )
+            continue
+        seen_links.add(link_key)
+
+        raw_title  = str(row[col_map["title"]]).strip()
+        title      = _clean_exercise_title(raw_title)
         category   = str(row[col_map["category"]]).strip()
         difficulty = str(row[col_map["difficulty"]]).strip()
-        parsed     = _parse_exercise_title(title)
+
+        dedupe_key = re.sub(r"\s+", " ", title).strip().lower()
+        title_counts[dedupe_key] = title_counts.get(dedupe_key, 0) + 1
+        if title_counts[dedupe_key] > 1:
+            logger.warning(
+                "Exercise Library.csv: two different videos share the title "
+                "%r — disambiguating with a suffix so both remain selectable "
+                "and distinguishable.",
+                title[:80],
+            )
+            title = f"{title} ({title_counts[dedupe_key]})"
+
+        parsed = _parse_exercise_title(raw_title, category=category)
         videos.append({
             "category":         category,
             "difficulty":       difficulty,
@@ -549,7 +628,12 @@ def _infer_difficulty_from_le8(le8_data: dict) -> str:
         if pa_score >= 40:
             return "Intermediate"
         return "Beginner"
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "_infer_difficulty_from_le8: malformed le8_data payload (%r) — "
+            "defaulting to Beginner. Payload keys: %s",
+            exc, list((le8_data or {}).keys()),
+        )
         return "Beginner"
 
 
@@ -601,9 +685,18 @@ def _detect_exercise_filters(history: list) -> dict:
     # category whose keyword appears LATEST in the text is used — that’s the
     # new preference.  Example: \u201cI said dumbbell but I want bodyweight instead\u201d
     # → \u201cbodyweight\u201d appears after \u201cinstead/but\u201d so it wins.
+    # NOTE: "actually" and "rather" are deliberately NOT bare triggers here —
+    # both are common as plain emphasis/preference words unrelated to
+    # switching an answer (e.g. "chair yoga is actually great for me",
+    # "I'd rather relax after"), and treating them as correction signals
+    # caused multi-category messages to collapse to the wrong single
+    # category. They only count when paired closely with an actual
+    # preference/action word.
     CORRECTION_RE = re.compile(
-        r"\b(instead|actually|wait|i meant|rather\b|but i want|but now|change to|"
-        r"switch to|forget the|scratch that|no,?\s+i want|not \w+ but)\b",
+        r"\b(instead|wait|i meant|but i want|but now|change to|"
+        r"switch to|forget the|scratch that|no,?\s+i want|not \w+ but|"
+        r"actually\b(?:\s+\w+){0,3}\s+(?:want|prefer|do|try)|"
+        r"rather\b(?:\s+\w+){0,3}\s+(?:than|do|try|have))\b",
         re.IGNORECASE,
     )
     for msg in reversed(user_msgs):
@@ -736,6 +829,23 @@ def _match_exercise_videos(filters: dict, difficulty: str) -> tuple:
         return [], -1
 
     format_lower      = [f.lower() for f in (filters.get("format")      or [])]
+
+    # "Chair Yoga" is NOT a distinct value in the CSV's category column —
+    # every chair-yoga video (and every mat/standing yoga video) is tagged
+    # category "Yoga"; chair yoga is only distinguishable by format (all
+    # chair yoga rows resolve to format "Seated", see
+    # _parse_exercise_title's category-based fallback). Without this
+    # translation, a user who explicitly asks for chair yoga would never
+    # match on category == "chair yoga" (nothing in EXERCISE_VIDEOS has
+    # that category value), so cat_ok() would fail even at level 0-2 and
+    # the progressive fallback would relax all the way to level 4 —
+    # silently handing back irrelevant Bodyweight/Dumbbell videos instead
+    # of the seated yoga videos that actually satisfy the request.
+    if "chair yoga" in categories_lower:
+        categories_lower = ["yoga" if c == "chair yoga" else c for c in categories_lower]
+        if "seated" not in format_lower:
+            format_lower = format_lower + ["seated"]
+
     dur_min           = filters.get("duration_min")
     dur_max           = filters.get("duration_max")
     exclusions        = filters.get("exclusions") or []
@@ -798,6 +908,71 @@ def _ev4_was_asked(history: list) -> bool:
         content = msg.get("content", "").lower()
         if "balanc" in content and "jumping" in content and "kneeling" in content:
             return True
+    return False
+
+
+# Exercise-intent signal words for the per-turn relevance gate below. Mirrors
+# category/format vocabulary from _detect_exercise_filters plus general
+# workout/exercise language, so we can tell "this turn is about exercise"
+# apart from "the user mentioned a category once, several turns ago."
+_EXERCISE_INTENT_RE = re.compile(
+    r"\b(exercise|workout|work[\s-]?out|video|videos|routine|move more|"
+    r"physical activity|bodyweight|body weight|dumbbell|dumbbells|"
+    r"resistance band|resistance bands|hand weight|chair yoga|tai chi|yoga|"
+    r"seated|standing|stretch|cardio|beginner|intermediate|advanced)\b",
+    re.IGNORECASE,
+)
+
+# Short affirmations / "give me another" follow-ups that carry no exercise
+# vocabulary of their own but should still surface videos when they come
+# right after the assistant offered some — e.g. "yes", "show me another".
+# Deliberately narrow and short-message-only (see length guard below) so a
+# topic-changing message that happens to contain "yes" or "ok" doesn't get
+# misread as a continuation — e.g. "yes I know but actually I want to talk
+# about my sleep" must NOT gate videos back on.
+_EXERCISE_CONTINUATION_RE = re.compile(
+    r"^\s*(yes|yeah|yep|sure|ok(?:ay)?|please|"
+    r"(?:show me |can you show me )?(?:more|another)(?: one)?s?|"
+    r"next (?:one|video)|that works|sounds good)\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _exercise_turn_is_relevant(user_message: str, history: list) -> bool:
+    """
+    Return True only if THIS turn is actually about exercise, so
+    `exercise_videos` isn't attached to every response for the rest of the
+    conversation just because the user answered the EV1–EV4 intake earlier.
+
+    Without this check, `min_filters_set and _ev4_was_asked(history)` alone
+    stays true forever once intake is complete, so a later turn about sleep
+    or diet would still carry a populated exercise_videos array even though
+    the assistant's reply (per the system prompt's gating rule) correctly
+    says nothing about videos — a frontend/backend mismatch where cards
+    render for an unrelated message.
+
+    Mirrors `_animation_matches_conversation`'s per-turn topic gating for
+    animation cards, adapted to exercise vocabulary. A turn counts as
+    relevant if the current user message itself mentions exercise, OR if the
+    current message is a short continuation/affirmation (see
+    _EXERCISE_CONTINUATION_RE) AND the assistant's immediately preceding
+    message was about exercise. The continuation check is intentionally
+    narrow — without it, ANY message right after an exercise turn (including
+    a topic change like "actually, how's my sleep looking?") would
+    incorrectly keep surfacing videos just because the prior assistant
+    message mentioned them.
+    """
+    if _EXERCISE_INTENT_RE.search(user_message or ""):
+        return True
+
+    if _EXERCISE_CONTINUATION_RE.match((user_message or "").strip()):
+        last_assistant = ""
+        for msg in reversed(history):
+            if msg.get("role") == "assistant":
+                last_assistant = msg.get("content", "") or ""
+                break
+        return bool(_EXERCISE_INTENT_RE.search(last_assistant))
+
     return False
 
 
@@ -2009,7 +2184,16 @@ def chatbot():
     # Requiring duration here caused videos to never surface when EV3 was
     # skipped or the user didn't explicitly specify a duration range.
     min_filters_set     = bool(curr_filters.get("categories"))
-    if min_filters_set and _ev4_was_asked(history):
+    # Per-turn relevance gate: even once intake (EV1-EV4) is complete, only
+    # attach exercise_videos when THIS turn is actually about exercise (see
+    # _exercise_turn_is_relevant docstring). Without this, every later turn
+    # in the conversation — including ones about sleep, diet, or LE8 scores
+    # — would carry a stale populated exercise_videos array.
+    if (
+        min_filters_set
+        and _ev4_was_asked(history)
+        and _exercise_turn_is_relevant(user_message, history)
+    ):
         exercise_videos, fallback_level = _match_exercise_videos(curr_filters, exercise_difficulty)
         exercise_match_note = _build_exercise_match_note(
             curr_filters, exercise_difficulty, fallback_level, exercise_videos
