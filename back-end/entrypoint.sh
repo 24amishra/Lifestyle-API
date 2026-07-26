@@ -23,4 +23,13 @@ else
 fi
 
 echo "Starting Flask app..."
-exec gunicorn --bind 0.0.0.0:"${PORT:-5000}" --workers 1 --timeout 120 app:app
+# --limit-request-field_size / --limit-request-fields raised above gunicorn's
+# defaults (8190 bytes / 100 fields). A large Cookie header (e.g. an
+# accumulated session cookie, or a stale cookie left over from another local
+# app that used this same port) can exceed the default limit; gunicorn then
+# drops the connection without sending a real HTTP response, which the
+# browser reports as a bare "TypeError: Failed to fetch" instead of a
+# diagnosable error. Raising the limit avoids that failure mode for
+# legitimately larger (but not abusive) header sets.
+exec gunicorn --bind 0.0.0.0:"${PORT:-5000}" --workers 1 --timeout 120 \
+    --limit-request-field_size 16380 --limit-request-fields 200 app:app
