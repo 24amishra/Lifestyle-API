@@ -1556,17 +1556,32 @@ def _animation_matches_conversation(
     anim_title: str,
     history: list,
     current_message: str,
-    window: int = 10,
+    window: int = 2,
 ) -> bool:
     """
     Return True if the animation section title shares at least one meaningful
-    keyword with the recent conversation, False otherwise.
+    keyword with the CURRENT turn, False otherwise.
 
     This prevents cross-topic animation cards — e.g. a "Sleep Hygiene" card
-    surfacing mid-way through a Physical Activity MI intake — by requiring
-    that some word in the animation title also appears somewhere in the last
-    `window` messages.  Generic health words are excluded from the comparison
-    via _ANIM_STOPWORDS so they don't create false matches.
+    surfacing on a later turn that's actually about medication side effects
+    and goal confidence, just because "sleep" (or a sleep-adjacent word) came
+    up several turns earlier in the conversation.
+
+    window=2 deliberately mirrors _build_rag_query's own scope (current
+    user message + the single immediately-preceding assistant message —
+    i.e. "what was just asked, and what the user just said"), not the whole
+    recent history. An earlier version used window=10, which kept a topic
+    "hot" for up to ~5 exchanges after it was last mentioned: if the user
+    discussed sleep during an LE8 intake question and then moved on to an
+    unrelated goal-setting/confidence-scaling exchange a few turns later,
+    "sleep" was still inside that 10-message window and let a stale sleep
+    animation back in — even though nothing in the actual current exchange
+    was about sleep. Keeping the gate scoped to the current turn only fixes
+    that without reintroducing the original problem (a completely
+    context-free keyword match against the whole conversation).
+
+    Generic health words are excluded from the comparison via
+    _ANIM_STOPWORDS so they don't create false matches.
 
     If the animation title has no meaningful keywords (e.g. a very short or
     generic title), we allow it through rather than silently suppressing it.
@@ -2223,10 +2238,14 @@ def chatbot():
     # The ANIMATION_SURFACE_THRESHOLD (0.82) is intentionally lenient because
     # script chunks embed in a different stylistic register than health
     # questions.  That leniency can cause off-topic cards (e.g. a sleep
-    # animation surfacing mid Physical Activity MI intake) when the embedding
-    # overlap is marginal and domain-unrelated.  We drop any animation whose
-    # section title shares no meaningful keyword with the last 10 turns, which
-    # is a cheap text-level guard that doesn't require an extra embedding call.
+    # animation surfacing on a turn that's actually about something else
+    # entirely) when the embedding overlap is marginal and domain-unrelated.
+    # We drop any animation whose section title shares no meaningful keyword
+    # with the CURRENT turn (current message + the single immediately-
+    # preceding assistant message — see _animation_matches_conversation's
+    # docstring for why this is scoped tightly rather than to the last 10
+    # messages), which is a cheap text-level guard that doesn't require an
+    # extra embedding call.
     # -----------------------------------------------------------------------
     if animations:
         animations = [
