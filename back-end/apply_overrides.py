@@ -19,6 +19,7 @@ Safe to re-run — overwriting with the same URL is a no-op in effect.
 
 import json
 import os
+import re
 import sys
 import difflib
 from dotenv import load_dotenv
@@ -99,11 +100,35 @@ def load_overrides() -> dict:
     return active
 
 
-def apply_overrides(overrides: dict, collection, stored_titles: list) -> None:
+def _normalize_title(title: str) -> str:
+    """
+    Collapse whitespace/newline differences so overrides don't silently fail
+    to match just because the PDF re-wrapped a heading across a line break
+    (which changes an internal space/newline but not the actual title).
+    Exact matching is still tried first — this is only a fallback.
+    """
+    return re.sub(r"\s+", " ", (title or "")).strip().lower()
+
+
+def apply_overrides(overrides: dict, collection, stored_titles: list) -> bool:
+    """
+    Apply each override to ChromaDB. Returns True if every override matched
+    and was applied, False if any title had no match — callers (and the
+    process exit code) should treat False as a failure, not a soft warning,
+    since a silently-unapplied override means a user-facing animation link
+    stays wrong.
+    """
     total_updated = 0
     not_found = []
 
+    # Build a whitespace-normalized lookup so a title in
+    # animation_overrides.json that differs from the stored section_title
+    # only by whitespace/newlines (a common artifact of PDF text re-wrapping)
+    # still matches, instead of silently no-op'ing.
+    normalized_lookup = {_normalize_title(t): t for t in stored_titles}
+
     for title, new_url in overrides.items():
+        actual_title = title
         try:
             results = collection.get(
                 where={"section_title": {"$eq": title}},
@@ -111,10 +136,32 @@ def apply_overrides(overrides: dict, collection, stored_titles: list) -> None:
             )
         except Exception as e:
             print(f"  ERROR querying for '{title}': {e}")
+            not_found.append(title)
             continue
 
         ids = results.get("ids", [])
         metadatas = results.get("metadatas", [])
+
+        if not ids:
+            # Fallback: retry with whitespace-normalized matching before
+            # giving up, so re-wrapped PDF headings don't silently fail.
+            fallback_title = normalized_lookup.get(_normalize_title(title))
+            if fallback_title and fallback_title != title:
+                try:
+                    results = collection.get(
+                        where={"section_title": {"$eq": fallback_title}},
+                        include=["metadatas"],
+                    )
+                    ids = results.get("ids", [])
+                    metadatas = results.get("metadatas", [])
+                    if ids:
+                        actual_title = fallback_title
+                        print(
+                            f"  (matched '{title}' to stored title "
+                            f"'{fallback_title}' via whitespace-normalized fallback)"
+                        )
+                except Exception as e:
+                    print(f"  ERROR querying fallback for '{title}': {e}")
 
         if not ids:
             not_found.append(title)
@@ -128,10 +175,11 @@ def apply_overrides(overrides: dict, collection, stored_titles: list) -> None:
 
         try:
             collection.update(ids=ids, metadatas=updated_metadatas)
-            print(f"  ✓  {len(ids):>3} chunks  →  {title}")
+            print(f"  ✓  {len(ids):>3} chunks  →  {actual_title}")
             total_updated += len(ids)
         except Exception as e:
             print(f"  ERROR updating chunks for '{title}': {e}")
+            not_found.append(title)
 
     print(f"\nDone. {total_updated} chunk(s) updated in ChromaDB.")
 
@@ -148,6 +196,8 @@ def apply_overrides(overrides: dict, collection, stored_titles: list) -> None:
             else:
                 print(f"    → No close match found. Run --list to see all stored titles.")
             print()
+
+    return not not_found
 
 
 if __name__ == "__main__":
@@ -171,5 +221,12 @@ if __name__ == "__main__":
     stored = all_section_titles(col)
 
     print(f"Applying {len(overrides)} override(s):\n")
-    apply_overrides(overrides, col, stored)
+    all_applied = apply_overrides(overrides, col, stored)
     print("\nNo re-embedding needed. Restart Flask to pick up the changes.")
+
+    # Exit non-zero on partial failure so this is never silently "green" in
+    # an automated pipeline (e.g. run right after ingest.py) when one or
+    # more overrides didn't actually match anything in ChromaDB.
+    if not all_applied:
+        print("\nExiting with error status: one or more overrides were not applied.")
+        sys.exit(1)
