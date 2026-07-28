@@ -1,0 +1,42 @@
+services:
+  backend:
+    build:
+      context: ./back-end
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      FLASK_DEBUG: "1"
+      FRONTEND_URL: "http://localhost:3000"
+      REDIRECT_URI: "http://localhost:5000/callback"
+      USE_MOCK_FITBIT: "1"
+    volumes:
+      - ./back-end/app.py:/app/app.py
+      - ./back-end/ingest.py:/app/ingest.py
+      - ./back-end/apply_overrides.py:/app/apply_overrides.py
+      - ./back-end/animation_overrides.json:/app/animation_overrides.json
+      - ./back-end/mock_fitbit_data.json:/app/mock_fitbit_data.json
+      - ./back-end/documents:/app/documents
+      - "./back-end/Exercise Library.csv:/app/Exercise Library.csv"
+      - backend-chroma:/app/chroma_db
+    depends_on: []
+
+  frontend:
+    build:
+      context: ./front-end
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_API_URL: "http://localhost:5000"
+      CHOKIDAR_USEPOLLING: "true"
+      WATCHPACK_POLLING: "true"
+    volumes:
+      - ./front-end/src:/app/src
+      - /app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  backend-chroma:
