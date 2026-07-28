@@ -610,31 +610,168 @@ logger.info(
 )
 
 
-def _infer_difficulty_from_le8(le8_data: dict) -> str:
+def _pa_score(le8_data: dict):
     """
-    Map the user's LE8 Physical Activity score to an exercise difficulty level.
-    Falls back to Beginner when no score is available.
+    Return the LE8 Physical Activity sub-score, or None if unavailable.
+
+    Split out from _infer_difficulty_from_le8 because the mismatch note needs
+    the raw score to disclose WHERE an inferred difficulty came from, not just
+    the level it produced.
+
+    NUMERIC GUARD: le8_data comes from the request body and is only validated as
+    a dict, so every nested value is client-controlled. Returning a non-numeric
+    score would push a TypeError into the caller's `>=` comparisons — a 500 on
+    demand via {"score": "75"}. Same check as _safe_numeric, bool excluded
+    because bool is a subclass of int.
     """
     try:
-        pa_score = (
+        score = (
             (le8_data or {}).get("metrics", {})
                            .get("physical_activity", {})
                            .get("score")
         )
-        if pa_score is None:
-            return "Beginner"
-        if pa_score >= 70:
-            return "Advanced"
-        if pa_score >= 40:
-            return "Intermediate"
-        return "Beginner"
     except Exception as exc:
         logger.warning(
-            "_infer_difficulty_from_le8: malformed le8_data payload (%r) — "
-            "defaulting to Beginner. Payload keys: %s",
+            "_pa_score: malformed le8_data payload (%r). Payload keys: %s",
             exc, list((le8_data or {}).keys()),
         )
+        return None
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        return score
+    if score is not None:
+        logger.warning(
+            "_pa_score: non-numeric physical_activity score (%r) — treating as "
+            "unavailable.", score,
+        )
+    return None
+
+
+def _infer_difficulty_from_le8(le8_data: dict) -> str:
+    """
+    Map the user's LE8 Physical Activity score to an exercise difficulty level.
+    Falls back to Beginner when no score is available.
+
+    NOTE: an inferred level is a guess about the user, not a request from them.
+    Callers must go through _resolve_exercise_difficulty() so the provenance
+    travels with the value.
+    """
+    pa_score = _pa_score(le8_data)
+    if pa_score is None:
         return "Beginner"
+    if pa_score >= 70:
+        return "Advanced"
+    if pa_score >= 40:
+        return "Intermediate"
+    return "Beginner"
+
+
+def _resolve_exercise_difficulty(filters: dict, le8_data: dict) -> tuple:
+    """
+    Resolve which difficulty level to use, and record where it came from.
+
+    Returns (level, source, pa_score):
+      level    — "Beginner" | "Intermediate" | "Advanced"
+      source   — "stated" if the user asked for this level, "inferred" if it was
+                 derived from their LE8 Physical Activity score
+      pa_score — the PA sub-score behind an inferred level, else None
+
+    WHY THE SOURCE TRAVELS WITH THE LEVEL: the two cases must behave
+    differently downstream, and neither the matcher nor the note builder can
+    tell them apart from the level string alone.
+
+      stated   → the user made a choice, so it may FILTER. If nothing matches,
+                 the mismatch note can honestly report "we don't have Beginner
+                 Tai Chi in that length" — true, and about something they asked
+                 for.
+      inferred → we guessed, so it should only RANK (_rank_by_difficulty,
+                 PLANNED — not yet implemented; pending the filter-vs-rank
+                 decision). A level nobody requested can then neither remove
+                 videos from the results nor generate a claim about inventory,
+                 which is what stops the phantom-Advanced class of bug from
+                 recurring: only 2 of the 30 linked videos are Advanced, and
+                 both Yoga and Tai Chi are Beginner-only, so inferring Advanced
+                 from a PA score empties levels 0-2 on nearly every request.
+
+    Wiring this in is behaviour-neutral for the inferred case: with nothing
+    stated it returns exactly what _infer_difficulty_from_le8 returns.
+    """
+    stated = (filters or {}).get("difficulty")
+    if stated:
+        return stated, "stated", None
+    return _infer_difficulty_from_le8(le8_data), "inferred", _pa_score(le8_data)
+
+
+def _is_ev4_question(text: str) -> bool:
+    """
+    Return True if `text` is the assistant's [EV4] movement-exclusions question.
+
+    Detection: the distinctive triple of 'balanc', 'jumping' and 'kneeling' in a
+    single message.  'balanc' (prefix) covers both 'balance' and 'balancing'
+    regardless of how the chatbot phrases it.
+
+    COUPLED TO PROMPT WORDING: three call sites depend on this triple —
+    _ev4_was_asked (bool over all history), the [EV4] exclusion scan in
+    _detect_exercise_filters (needs the asking message's index), and the
+    per-turn relevance gate in _exercise_turn_is_relevant (last assistant
+    message only).  Each keeps its own iteration; only the single-message test
+    is shared.  If the [EV4] question is reworded in the system prompt to drop
+    any of these three words, all three call sites go silently dead — update
+    this predicate, not the call sites.
+    """
+    t = (text or "").lower()
+    return "balanc" in t and "jumping" in t and "kneeling" in t
+
+
+def _last_assistant_message(history: list) -> str:
+    """Return the most recent assistant message's content, or '' if none."""
+    for msg in reversed(history or []):
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            return msg.get("content", "") or ""
+    return ""
+
+
+# A difficulty level the user is REQUESTING, not merely mentioning. A bare
+# beginner|intermediate|advanced match is not enough: "I tried an advanced yoga
+# class years ago and it was way too hard" is a very plausible answer to the
+# barriers question [U4], and bare matching would read it as a request for
+# Advanced — the precise opposite of what the user means. So the level word
+# only counts when a preference/action verb sits near it. Same pattern as
+# CORRECTION_RE below, for the same reason.
+_STATED_DIFFICULTY_RE = re.compile(
+    r"\b(?:want|wanted|prefer|looking for|give me|show me|do you have|"
+    r"need|something|anything|start(?:ing)? with|keep it|make it|"
+    r"switch to|stick to|stick with)\b(?:\s+\w+){0,4}?\s+"
+    r"\b(beginner|intermediate|advanced)\b",
+    re.IGNORECASE,
+)
+
+# Negated or past-tense difficulty. "I want something not too advanced" DOES
+# satisfy _STATED_DIFFICULTY_RE (want … advanced) but means the opposite, so
+# these contexts veto the match.
+#
+# KNOWN LIMITATION: a veto falls through to the inferred level rather than
+# inferring the complement — "not too advanced" does not become Intermediate.
+# Deliberate: with three levels, guessing which one the user meant is exactly
+# the kind of unrequested classification this whole change removes.
+_DIFFICULTY_NEGATION_RE = re.compile(
+    r"\b(?:not|nothing|no|never|avoid|isn'?t|aren'?t|don'?t|doesn'?t|"
+    r"wasn'?t|too|overly|less|tried|used to)\b(?:\s+\w+){0,2}?\s+"
+    r"\b(beginner|intermediate|advanced)\b",
+    re.IGNORECASE,
+)
+
+# "Advanced" as a disease descriptor, not a workout tier. Non-negotiable guard
+# for this population: reading "my advanced breast cancer" as a request for
+# advanced workouts would hand a strenuous routine to someone describing a
+# late-stage diagnosis. The [\s-] covers "advanced-stage" ("stage" is itself in
+# the disease list, so that matches with zero intervening words).
+_CLINICAL_ADVANCED_RE = re.compile(
+    r"\badvanced[\s-]+(?:\w+\s+){0,2}?(?:cancer|carcinoma|tumou?r|disease|"
+    r"illness|stage|diagnosis|metasta\w*|melanoma|lymphoma|leukemia)\b|"
+    r"\b(?:cancer|carcinoma|tumou?r|disease|illness|diagnosis|metasta\w*|"
+    r"melanoma|lymphoma|leukemia)\b(?:\s+\w+){0,3}?\s+\badvanced\b",
+    re.IGNORECASE,
+)
 
 
 def _detect_exercise_filters(history: list) -> dict:
@@ -657,6 +794,10 @@ def _detect_exercise_filters(history: list) -> dict:
         "duration_min": None,
         "duration_max": None,
         "exclusions":   [],
+        # Difficulty the user explicitly ASKED for, or None. Distinct from the
+        # level inferred from their LE8 PA score — see the stated-difficulty
+        # block below and _resolve_exercise_difficulty().
+        "difficulty":   None,
     }
 
     user_msgs = [
@@ -774,6 +915,66 @@ def _detect_exercise_filters(history: list) -> dict:
             filters["duration_min"], filters["duration_max"] = _minutes_to_bracket(int(m.group(1)))
             break
 
+    # ── Stated difficulty (volunteered — not one of EV1–EV4) ────────────
+    # The intake never asks for a difficulty level; it is normally inferred from
+    # the LE8 PA score. But users volunteer one ("I want beginner workouts"),
+    # and because _EXERCISE_INTENT_RE already counts beginner/intermediate/
+    # advanced as exercise intent, such a turn reaches matching and then had the
+    # preference discarded — `difficulty` was a separate argument whose only
+    # source was the inference. A stated level is an explicit choice and takes
+    # precedence; see _resolve_exercise_difficulty().
+    #
+    # Guards run in order: clinical veto, then negation veto, then the positive
+    # preference-verb match. Both vetoes are message-wide rather than scoped to
+    # the matched word — coarser, but it errs toward NOT setting a level, which
+    # is the safe direction here.
+    #
+    # A veto BREAKS rather than continues. Continuing would keep scanning older
+    # messages and could resurrect a stale level: "I want advanced workouts" at
+    # turn 3, then "actually, nothing too advanced" at turn 20, would veto turn
+    # 20 and then match turn 3 — setting Advanced, the opposite of the
+    # correction, and inverting the newest-first convention the other filters
+    # follow. A veto means the newest mention of difficulty was not a request,
+    # so resolution should fall through to the inferred level.
+    for msg in reversed(user_msgs):
+        t = msg["content"].lower()
+
+        # Negation is tested FIRST and independently of the preference-verb
+        # pattern. The phrasing that matters most here usually has no verb at
+        # all: "actually, nothing too advanced" does NOT match
+        # _STATED_DIFFICULTY_RE, so nesting this check behind that match let the
+        # message fall through to `continue` and an older "I want advanced
+        # workouts" then won — the correction producing the very level it
+        # retracted. A negated level IS the newest difficulty signal, so it ends
+        # the scan and resolution falls through to the inferred level.
+        if _DIFFICULTY_NEGATION_RE.search(t):
+            logger.info(
+                "stated difficulty vetoed — level appears in a negated/past-tense "
+                "context; falling through to the inferred level"
+            )
+            break
+
+        m = _STATED_DIFFICULTY_RE.search(t)
+        if not m:
+            # No request in this message. A bare or purely clinical mention
+            # ("my advanced cancer makes it hard") is not a preference, so keep
+            # looking backwards — that must not wipe an earlier real request.
+            continue
+
+        level = m.group(1)
+        if level == "advanced" and _CLINICAL_ADVANCED_RE.search(t):
+            # Request-shaped but clinically ambiguous ("I want advanced workouts
+            # for my advanced breast cancer"). Too risky to honour for this
+            # population, so stop without setting a level.
+            logger.info(
+                "stated difficulty vetoed — 'advanced' sits in clinical context "
+                "here, not a workout tier"
+            )
+            break
+
+        filters["difficulty"] = level.capitalize()
+        break
+
     # ── [EV4] Movement exclusions ────────────────────────────────────────
     # Only accumulate exclusions from user messages that came AFTER the EV4
     # question was asked.  Scanning the full history caused false positives —
@@ -782,11 +983,9 @@ def _detect_exercise_filters(history: list) -> dict:
     _all_msgs_for_ev4 = history[-MAX_HISTORY_STORED:]
     _ev4_asked_at = None
     for _j, _m in enumerate(_all_msgs_for_ev4):
-        if _m.get("role") == "assistant":
-            _c = _m.get("content", "").lower()
-            if "balanc" in _c and "jumping" in _c and "kneeling" in _c:
-                _ev4_asked_at = _j
-                break
+        if _m.get("role") == "assistant" and _is_ev4_question(_m.get("content", "")):
+            _ev4_asked_at = _j
+            break
 
     if _ev4_asked_at is not None:
         _post_ev4_user_msgs = [
@@ -883,6 +1082,12 @@ def _match_exercise_videos(filters: dict, difficulty: str) -> tuple:
         elif level == 2: results = [v for v in eligible if cat_ok(v) and diff_ok(v)]
         elif level == 3: results = [v for v in eligible if cat_ok(v)]
         else:            results = eligible
+        # Candidate-pool size per level. This is the direct readout of the
+        # difficulty-as-hard-filter problem: for a user inferred Advanced,
+        # levels 0-2 come back empty and level 3 suddenly returns everything,
+        # because only 2 of the 30 linked videos are Advanced and both Yoga and
+        # Tai Chi are Beginner-only. Keep at info until that is fixed.
+        logger.info("  exercise level %d → %d candidates", level, len(results))
         if results:
             return results[:MAX_EXERCISE_VIDEOS], level
 
@@ -894,9 +1099,8 @@ def _ev4_was_asked(history: list) -> bool:
     Return True if the chatbot has already asked the EV4 movement-exclusions
     question in this conversation.
 
-    Detection: looks for the distinctive triple of 'balanc', 'jumping', and
-    'kneeling' in any single assistant message.  Using 'balanc' (prefix) covers
-    both 'balance' and 'balancing' regardless of how the chatbot phrases it.
+    Detection is delegated to _is_ev4_question() — see that predicate for the
+    match rule and its coupling to the [EV4] prompt wording.
 
     Accepts the full sanitized history (not just truncated_history) so the
     gate stays open even in long conversations where EV4 was asked > 20
@@ -905,8 +1109,7 @@ def _ev4_was_asked(history: list) -> bool:
     for msg in history:
         if msg.get("role") != "assistant":
             continue
-        content = msg.get("content", "").lower()
-        if "balanc" in content and "jumping" in content and "kneeling" in content:
+        if _is_ev4_question(msg.get("content", "")):
             return True
     return False
 
@@ -952,31 +1155,68 @@ def _exercise_turn_is_relevant(user_message: str, history: list) -> bool:
     render for an unrelated message.
 
     Mirrors `_animation_matches_conversation`'s per-turn topic gating for
-    animation cards, adapted to exercise vocabulary. A turn counts as
-    relevant if the current user message itself mentions exercise, OR if the
-    current message is a short continuation/affirmation (see
-    _EXERCISE_CONTINUATION_RE) AND the assistant's immediately preceding
-    message was about exercise. The continuation check is intentionally
-    narrow — without it, ANY message right after an exercise turn (including
-    a topic change like "actually, how's my sleep looking?") would
-    incorrectly keep surfacing videos just because the prior assistant
-    message mentioned them.
+    animation cards, adapted to exercise vocabulary.  A turn counts as
+    relevant when any of these hold:
+
+      1. The current user message itself mentions exercise
+         (_EXERCISE_INTENT_RE).
+      2. The assistant's immediately preceding message was the [EV4]
+         movement-exclusions question — an answer to a direct question is on
+         topic whatever words it uses.
+      3. The assistant's immediately preceding message was about exercise AND
+         the current message is a short continuation/affirmation
+         (_EXERCISE_CONTINUATION_RE).
+
+    Cases 2 and 3 both require the preceding assistant message to establish
+    the topic, because the user message alone carries no exercise vocabulary.
+    Case 3 is deliberately narrow — without the continuation whitelist, ANY
+    message right after an exercise turn (including a topic change like
+    "actually, how's my sleep looking?") would keep surfacing videos just
+    because the prior assistant message mentioned them.
     """
-    if _EXERCISE_INTENT_RE.search(user_message or ""):
+    msg = (user_message or "").strip()
+    if _EXERCISE_INTENT_RE.search(msg):
         return True
 
-    if _EXERCISE_CONTINUATION_RE.match((user_message or "").strip()):
-        last_assistant = ""
-        for msg in reversed(history):
-            if msg.get("role") == "assistant":
-                last_assistant = msg.get("content", "") or ""
-                break
-        return bool(_EXERCISE_INTENT_RE.search(last_assistant))
+    last_assistant = _last_assistant_message(history)
+
+    # A direct answer to the [EV4] movement-exclusions question is always an
+    # exercise turn, whatever words it uses.  EV4 answers are things like
+    # "none", "jumping", "my knees are bad" — no exercise vocabulary, and not
+    # affirmations either, so they matched neither branch below and the gate
+    # closed on the exact turn intake completes.  That is the turn videos are
+    # supposed to FIRST appear, so nothing surfaced and, because the gate also
+    # skips _build_exercise_match_note, the model got no mismatch note either.
+    #
+    # KNOWN, ACCEPTED FALSE POSITIVE: this keys off the assistant's question,
+    # not the user's answer, so a user who pivots on this exact turn
+    # ("actually, can we talk about my sleep?") gets cards attached anyway.
+    # Narrow in practice (min_filters_set still requires a category), and the
+    # alternative — enumerating valid EV4 answers — is the brittleness this
+    # replaces.
+    if _is_ev4_question(last_assistant):
+        return True
+
+    # Everything below is a message with no exercise vocabulary of its own; it
+    # only counts as an exercise turn if the assistant was just talking about
+    # exercise.
+    # ORDER MATTERS: this guard must stay BELOW the _is_ev4_question check —
+    # the [EV4] question text ("...movements difficult or uncomfortable...
+    # balancing, jumping, or kneeling?") contains no _EXERCISE_INTENT_RE word,
+    # so hoisting this guard would make that branch unreachable and silently
+    # restore the bug.  It is also why the pre-fix failure was total rather
+    # than partial: even a bare "yes" after EV4 failed here.
+    if not _EXERCISE_INTENT_RE.search(last_assistant):
+        return False
+
+    if _EXERCISE_CONTINUATION_RE.match(msg):
+        return True
 
     return False
 
 
-def _build_exercise_match_note(filters: dict, difficulty: str, fallback_level: int, videos: list) -> str:
+def _build_exercise_match_note(filters: dict, difficulty: str, difficulty_source: str,
+                               fallback_level: int, videos: list) -> str:
     """
     Build a mismatch instruction injected as a late system message so the
     model acknowledges unavailable videos honestly.  Returns empty string
@@ -1006,7 +1246,13 @@ def _build_exercise_match_note(filters: dict, difficulty: str, fallback_level: i
 
     requested_desc = cats or "any category"
     if dur_label:   requested_desc += f", {dur_label}"
-    if difficulty:  requested_desc += f", {difficulty} level"
+    # Only claim a level was REQUESTED when the user actually stated one.
+    # Unconditionally appending an inferred level made the note header assert
+    # "The user requested: Bodyweight, 15–20 min, Advanced level" about a user
+    # who never mentioned difficulty — a falsehood handed to the model as fact,
+    # which it then relayed. See _resolve_exercise_difficulty for the two cases.
+    if difficulty and difficulty_source == "stated":
+        requested_desc += f", {difficulty} level"
     if fmts:        requested_desc += f", {fmts} format"
 
     if fallback_level == 1:
@@ -1018,40 +1264,48 @@ def _build_exercise_match_note(filters: dict, difficulty: str, fallback_level: i
             f"the closest option is {found_fmts}."
         )
         body = (
-            f"1. YOUR VERY FIRST SENTENCE: \"{opener}\"\n"
+            f"1. State this clearly in your reply: \"{opener}\"\n"
+            f"   Placement: if you are drafting a SMART goal this turn, complete "
+            f"the full synthesis first and put this note after it. Otherwise, "
+            f"lead with it.\n"
             f"2. Present the video positively — it IS the right category and duration.\n"
             f"3. CRITICAL: Do NOT call this a '{fmts}' workout or imply it is "
-            f"'{fmts}'. It is {found_fmts}. Contradicting this confuses the user.\n"
-            f"4. Do NOT suggest a different category."
+            f"'{fmts}'. It is {found_fmts}, and contradicting that confuses the "
+            f"user. Do NOT suggest a different category."
         )
     elif fallback_level == 2:
         # Duration relaxed: have category, but not at this duration
         opener = f"We don't currently have {cats} workouts in the {dur_label} range."
         body = (
-            f"1. YOUR VERY FIRST SENTENCE: \"{opener}\"\n"
+            f"1. State this clearly in your reply: \"{opener}\"\n"
+            f"   Placement: if you are drafting a SMART goal this turn, complete "
+            f"the full synthesis first and put this note after it. Otherwise, "
+            f"lead with it.\n"
             f"2. Offer the closest {cats} options available ({found_dur_str}) as a solid alternative.\n"
             f"3. Do NOT suggest a different category \u2014 we have {cats}, just not at that duration."
         )
     elif fallback_level == 3:
-        # Difficulty relaxed: have category + duration, just not at the inferred difficulty
+        # Difficulty relaxed. NOTE: difficulty is INFERRED from the user's LE8 PA
+        # score (_infer_difficulty_from_le8), never requested, so this note must
+        # not frame any level as unavailable or lead with it.
         found_diffs = ", ".join(sorted({v["difficulty"] for v in videos}))
-        opener = (
-            f"We have {cats} workouts{' in the ' + dur_label + ' range' if dur_label else ''} "
-            f"but not at {difficulty} level \u2014 surfacing {found_diffs} options instead."
-        )
         body = (
-            f"1. Briefly note that {difficulty}-level {cats} workouts aren't available"
-            f"{' in the ' + dur_label + ' range' if dur_label else ''}, "
-            f"but {found_diffs} options are.\n"
-            f"2. Present the video positively \u2014 it IS the right category"
-            f"{' and duration' if dur_label else ''}.\n"
+            f"1. Present the video positively \u2014 it IS the right category"
+            f"{' and duration' if dur_label else ''}. You may describe it as a "
+            f"{found_diffs}-level workout, but do not lead with that and do not "
+            f"frame the level as a limitation.\n"
+            "2. Do NOT say any difficulty level is unavailable, and do NOT "
+            "apologize for the level \u2014 the user never requested one.\n"
             "3. Do NOT suggest a different category or workout type."
         )
     else:
         # Category/all relaxed: nothing matched, surfacing alternatives
         opener = f"We don't have {cats} workouts matching your preferences right now."
         body = (
-            f"1. YOUR VERY FIRST SENTENCE: \"{opener}\"\n"
+            f"1. State this clearly in your reply: \"{opener}\"\n"
+            f"   Placement: if you are drafting a SMART goal this turn, complete "
+            f"the full synthesis first and put this note after it. Otherwise, "
+            f"lead with it.\n"
             f"2. Present the closest alternative available (categories: {found_cats}).\n"
             "3. Offer to adjust preferences if the alternative doesn't suit them."
         )
@@ -1510,12 +1764,9 @@ def _build_rag_query(user_message: str, history: list) -> str:
     if not (is_short and is_followup):
         return user_message
 
-    # Find the most recent assistant message in history
-    last_assistant = ""
-    for msg in reversed(history):
-        if msg.get("role") == "assistant":
-            last_assistant = msg.get("content", "")[:300]
-            break
+    # Find the most recent assistant message in history, capped so a long reply
+    # doesn't dominate the embedding.
+    last_assistant = _last_assistant_message(history)[:300]
 
     if last_assistant:
         return f"{last_assistant} {user_message}"
@@ -2192,7 +2443,11 @@ def chatbot():
     truncated_history   = history[-MAX_HISTORY_MESSAGES:]
     pre_turn_msgs       = history + [{"role": "user", "content": user_message}]
     curr_filters        = _detect_exercise_filters(pre_turn_msgs)
-    exercise_difficulty = _infer_difficulty_from_le8(le8_data)
+    # A level the user ASKED for wins over the one inferred from their PA score.
+    # Behaviour-neutral when nothing is stated — see _resolve_exercise_difficulty.
+    exercise_difficulty, difficulty_source, difficulty_pa = (
+        _resolve_exercise_difficulty(curr_filters, le8_data)
+    )
     # Only require a category to be set before surfacing videos.
     # Duration is optional — the fallback system handles mismatches gracefully
     # (level-2 fallback) and _build_exercise_match_note informs the LLM.
@@ -2204,14 +2459,32 @@ def chatbot():
     # _exercise_turn_is_relevant docstring). Without this, every later turn
     # in the conversation — including ones about sleep, diet, or LE8 scores
     # — would carry a stale populated exercise_videos array.
-    if (
-        min_filters_set
-        and _ev4_was_asked(history)
-        and _exercise_turn_is_relevant(user_message, history)
-    ):
+    # Hoisted out of the `if` below so all three conditions are evaluated once
+    # and can be logged even when an earlier one short-circuits — otherwise a
+    # turn with no cards gives no signal as to WHICH condition closed the gate.
+    ev4_asked     = _ev4_was_asked(history)
+    turn_relevant = _exercise_turn_is_relevant(user_message, history)
+
+    logger.info(
+        "exercise gate — min_filters=%s ev4_asked=%s turn_relevant=%s → %s | "
+        "categories=%s format=%s duration=%s-%s exclusions=%s difficulty=%s (%s)",
+        min_filters_set, ev4_asked, turn_relevant,
+        "OPEN" if (min_filters_set and ev4_asked and turn_relevant) else "CLOSED",
+        curr_filters.get("categories"), curr_filters.get("format"),
+        curr_filters.get("duration_min"), curr_filters.get("duration_max"),
+        curr_filters.get("exclusions"), exercise_difficulty, difficulty_source,
+    )
+
+    if min_filters_set and ev4_asked and turn_relevant:
         exercise_videos, fallback_level = _match_exercise_videos(curr_filters, exercise_difficulty)
+        logger.info(
+            "exercise match — level=%s videos=%d titles=%s",
+            fallback_level, len(exercise_videos),
+            [v["title"][:40] for v in exercise_videos],
+        )
         exercise_match_note = _build_exercise_match_note(
-            curr_filters, exercise_difficulty, fallback_level, exercise_videos
+            curr_filters, exercise_difficulty, difficulty_source,
+            fallback_level, exercise_videos,
         )
     else:
         exercise_videos     = []
@@ -2411,6 +2684,9 @@ BEHAVIOR GUIDELINES:
 - Never diagnose, prescribe, or contradict medical advice.
 - If a user appears to be in crisis or mentions self-harm, respond with empathy
   and direct them to the 988 Suicide and Crisis Lifeline or their care team.
+  Crisis language takes precedence over SMART Goal Mode and the exercise video
+  flow for that turn — do not ask the next intake field or surface a video in
+  that reply.
 - Do not exit SMART Goal Mode mid-intake if the user asks a tangential question.
   Answer it briefly, then return to the next unfilled intake field.
   Example: "Great question — [brief answer]. Getting back to your goal —
@@ -2452,7 +2728,9 @@ CURRENT WEATHER & TIME:
 Time: {time_str}
 {weather}
 {resolved_location_line}Use time and weather together when recommending outdoor exercise.
-- Between 9 PM and 6 AM: suggest indoor or rest-based options.
+- Between 9 PM and 6 AM: suggest indoor or rest-based options. Do not apply the
+  9 PM–6 AM rule when Time contains 'UTC' — you don't know their local hour, so
+  give time-agnostic guidance instead.
 - Severe conditions (rain, below 50F, above 90F, high wind): suggest indoor alternatives.
 - If the user explicitly wants to go outside, respect that — briefly note conditions
   but do not override their choice.
@@ -2567,6 +2845,10 @@ UNIVERSAL FIELDS (required for every domain):
        true to raise that number before moving to synthesis.
 
 DOMAIN-SPECIFIC FIELDS (collect in addition to the universal fields):
+Collect all UNIVERSAL fields [U1]–[U6] before starting the domain-specific
+fields. The only exception is information the user volunteers on their own:
+acknowledge it, treat that field as filled, and never ask for it again — but do
+not let it pull you out of the universal sequence.
 
   PHYSICAL ACTIVITY:
   [PA1] Preferred activity type — what kind of movement do they enjoy
@@ -2767,9 +3049,18 @@ CRITICAL GATING RULE — NEVER CLAIM TO SURFACE VIDEOS EARLY:
   until you have received explicit answers to ALL FOUR questions [EV1]–[EV4]
   in this conversation. Claiming to surface videos before [EV4] has been asked
   produces a broken experience where nothing appears on screen.
+  The reverse is equally true: once the user has answered [EV4], video cards
+  ARE attached to your reply automatically. On any turn where you tell the user
+  you are surfacing videos, never ask permission to show them — state plainly
+  that you are surfacing them. Asking "Would you like to see those?" when the
+  cards are already on screen confuses the user.
 
 AFTER COLLECTING ANSWERS:
-- Tell the user you are surfacing matching videos for them.
+- Tell the user you are surfacing matching videos for them. State this as fact,
+  not as an offer. Never end a reply with "Would you like to see those?", "Let
+  me know if you'd like to see them", "Should I find some X videos?", or any
+  similar request for permission — the cards are already attached to that
+  reply. This applies to the first set of videos as well as to every later one.
 - Do NOT list, guess, or fabricate any video URLs yourself.
 - Video cards surface automatically alongside your response.
 - If physical limitations were mentioned, briefly acknowledge them.
@@ -2783,11 +3074,17 @@ IF ASKED ABOUT EXERCISES WITHOUT ANY PRIOR PREFERENCES:
 - Ask [EV1] first. Collect [EV1]\u2013[EV4] before surfacing recommendations.
 
 RESPONSE FORMAT:
-- Warm, concise (under 200 words when possible), and encouraging.
+- Warm, concise (under 200 words when possible), and encouraging. EXCEPTION: a
+  SMART goal synthesis (PHASE 2) is exempt from this word limit. Never drop or
+  shorten any of the five SMART components, the schedule, or the follow-up
+  questions in order to stay under 200 words.
 - When explaining an LE8 score, always include: the raw value, the score, the
   tier, and one specific actionable step to improve it.
 - Plain language; avoid medical jargon unless the user uses it first.
-- When listing options, keep it to 2-3 choices to avoid overwhelming the user."""
+- When listing options, keep it to 2-3 choices to avoid overwhelming the user.
+  EXCEPTION: the exercise preference questions [EV1] and [EV3] must be asked
+  with their full option lists exactly as written above. Do not trim,
+  summarize, regroup, or invent substitute options to fit the 2-3 limit."""
 
     # ---------------------------------------------------------------------------
     # Suppress exercise video mismatch note during SMART goal synthesis.
