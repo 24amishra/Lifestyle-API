@@ -4,19 +4,35 @@ the live chatbot.
 
 Usage:
     cd back-end
-    python evals/generate_dataset.py       # one-time / occasional refresh
-    deepeval test run evals/test_dataset_eval.py
+    python evals/DeepEval/generate_dataset.py       # one-time / occasional refresh
+    deepeval test run evals/DeepEval/test_dataset_eval.py
 
-This loads goldens from evals/generated/chatbot_100_goldens.json, generates
+This loads goldens from evals/DeepEval/generated/chatbot_100_goldens.json, generates
 actual_output + retrieval_context by calling /endpoint for each golden, then
 grades every resulting test case with the same metrics as
 evals/test_quality.py (Faithfulness for RAG-grounded questions, a custom
 Medical Safety GEval for safety-probe questions, a custom Motivational
 Interviewing Tone GEval for tone-sensitive questions).
+
+Error handling: `_call_chatbot` checks the HTTP status and retries with
+backoff (see `max_retries`) instead of silently treating a failed/rate-limited
+response as an empty reply -- previously a non-200 response (e.g. a 429 from
+this app's own rate limiter, or an upstream OpenAI failure) had no status
+check at all, so `data.get("reply", "")` quietly became `""` and got graded
+by AnswerRelevancy/GEval as if it were a genuine (very bad) answer instead of
+a harness-level failure. If /endpoint is still failing after retries are
+exhausted, `_call_chatbot` raises so the golden's test fails loudly (pytest
+reports it as a failure, not a false "bad answer" pass-through) -- matching
+evals/DeepEval/test_quality.py's loud-failure pattern. Since each golden is
+its own pytest test case (not a single sequential script), there's no
+separate resume/checkpoint mechanism to build here: re-running pytest (or
+`pytest --lf` to target only the previously-failed goldens) is the natural
+per-test "resume."
 """
 
 import os
 import sys
+import time
 
 import pytest
 from deepeval import assert_test
@@ -24,7 +40,18 @@ from deepeval.dataset import EvaluationDataset
 from deepeval.metrics import AnswerRelevancyMetric, FaithfulnessMetric, GEval
 from deepeval.test_case import LLMTestCase, SingleTurnParams
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# NOTE: this file lives at back-end/evals/DeepEval/test_dataset_eval.py (two
+# levels below back-end/), so getting to the backend root -- needed for
+# `import app` -- takes three dirname() hops from this file's path, not two.
+# A prior version of this line used dirname(dirname(abspath(__file__))),
+# which only reaches back-end/evals/ (a leftover from before this file was
+# moved into the DeepEval/ subfolder) and left `import app` working only by
+# accident when invoked in a way that also happens to put back-end/ on
+# sys.path (e.g. `python -m pytest` from back-end/) -- the exact same bug
+# already found and fixed in evals/DeepEval/test_quality.py.
+_HERE = os.path.dirname(os.path.abspath(__file__))  # back-end/evals/DeepEval
+_BACKEND_DIR = os.path.dirname(os.path.dirname(_HERE))  # back-end/
+sys.path.insert(0, _BACKEND_DIR)
 
 from app import app as flask_app  # noqa: E402
 
@@ -75,17 +102,26 @@ mi_tone_metric = GEval(
 )
 
 
-def _call_chatbot(message: str):
-    resp = client.post(
-        "/endpoint",
-        json={"message": message, "history": [], "le8_data": {}, "show_chunks": True},
+def _call_chatbot(message: str, max_retries: int = 2):
+    last_error = ""
+    for attempt in range(max_retries + 1):
+        resp = client.post(
+            "/endpoint",
+            json={"message": message, "history": [], "le8_data": {}, "show_chunks": True},
+        )
+        data = resp.get_json() or {}
+        if resp.status_code == 200 and "reply" in data:
+            debug = data.get("rag_debug", {}) or {}
+            chunks = debug.get("chunks", [])
+            retrieval_context = [c["text"] for c in chunks if c.get("used_in_context")]
+            return data.get("reply", ""), retrieval_context
+        last_error = data.get("error", f"HTTP {resp.status_code}")
+        if attempt < max_retries:
+            time.sleep(2 ** attempt)
+    raise AssertionError(
+        f"/endpoint failed after {max_retries + 1} attempt(s) for message "
+        f"{message[:80]!r}: {last_error}"
     )
-    data = resp.get_json() or {}
-    reply = data.get("reply", "")
-    debug = data.get("rag_debug", {}) or {}
-    chunks = debug.get("chunks", [])
-    retrieval_context = [c["text"] for c in chunks if c.get("used_in_context")]
-    return reply, retrieval_context
 
 
 @pytest.mark.parametrize(

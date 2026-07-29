@@ -12,10 +12,21 @@ Or as plain pytest (metrics still run, just without DeepEval's CLI report):
 Requires the same environment as the Flask app itself (OPENAI_API_KEY,
 MONGO_URI, an ingested ChromaDB, etc. - see back-end/.env). DeepEval's
 metrics use an LLM judge; by default that's GPT-4o via OPENAI_API_KEY.
+
+Error handling: `_call_chatbot` retries a non-200/malformed /endpoint
+response with backoff (see `max_retries`) before failing -- a single 429
+from this app's own rate limiter or a transient upstream OpenAI hiccup no
+longer fails the test outright. If /endpoint is still failing after retries
+are exhausted, the test still fails loudly (assertion with the response
+body attached), same as before -- it never silently treats a failed call as
+an empty reply. Each case is its own pytest test, so there's no separate
+resume/checkpoint mechanism here: re-running pytest (or `pytest --lf` for
+just the previously-failed cases) is the natural per-test "resume."
 """
 
 import os
 import sys
+import time
 
 import pytest
 from deepeval import assert_test
@@ -71,23 +82,38 @@ mi_tone_metric = GEval(
 )
 
 
-def _call_chatbot(case: dict):
-    resp = client.post(
-        "/endpoint",
-        json={
-            "message": case["input"],
-            "history": case.get("history", []),
-            "le8_data": case.get("le8_data", {}),
-            "show_chunks": True,
-        },
+def _call_chatbot(case: dict, max_retries: int = 2):
+    """Calls /endpoint, retrying with backoff on a non-200 / malformed
+    response (e.g. a 429 from this app's own rate limiter, or a transient
+    upstream OpenAI failure) instead of failing on the very first hiccup.
+    Still fails loudly (assertion) if /endpoint is still erroring after all
+    retries are exhausted -- never silently treats a failed call as an empty
+    reply.
+    """
+    last_body = ""
+    for attempt in range(max_retries + 1):
+        resp = client.post(
+            "/endpoint",
+            json={
+                "message": case["input"],
+                "history": case.get("history", []),
+                "le8_data": case.get("le8_data", {}),
+                "show_chunks": True,
+            },
+        )
+        data = resp.get_json() or {}
+        if resp.status_code == 200 and "reply" in data:
+            debug = data.get("rag_debug", {}) or {}
+            chunks = debug.get("chunks", [])
+            retrieval_context = [c["text"] for c in chunks if c.get("used_in_context")]
+            return data.get("reply", ""), retrieval_context
+        last_body = resp.get_data(as_text=True)
+        if attempt < max_retries:
+            time.sleep(2 ** attempt)
+    assert False, (
+        f"/endpoint failed after {max_retries + 1} attempt(s) for input "
+        f"{case['input'][:80]!r}: {last_body}"
     )
-    assert resp.status_code == 200, resp.get_data(as_text=True)
-    data = resp.get_json()
-    reply = data.get("reply", "")
-    debug = data.get("rag_debug", {}) or {}
-    chunks = debug.get("chunks", [])
-    retrieval_context = [c["text"] for c in chunks if c.get("used_in_context")]
-    return reply, retrieval_context
 
 
 @pytest.mark.parametrize(
