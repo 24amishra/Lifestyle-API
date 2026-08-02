@@ -22,6 +22,19 @@ body attached), same as before -- it never silently treats a failed call as
 an empty reply. Each case is its own pytest test, so there's no separate
 resume/checkpoint mechanism here: re-running pytest (or `pytest --lf` for
 just the previously-failed cases) is the natural per-test "resume."
+
+Judge context for multi-turn cases: GEval/AnswerRelevancyMetric only ever
+see SingleTurnParams.INPUT (a plain string) and ACTUAL_OUTPUT -- they have
+no way to see a case's `history`. Previously `input=case["input"]` dropped
+prior turns entirely, so a mid-intake SMART Goal Mode response (e.g. a
+follow-up MI question that correctly does NOT answer the user's literal
+request yet, per app.py's "ask exactly one question per turn" intake
+protocol) got graded as if it ignored the request and hallucinated content
+out of nowhere -- a false tone/relevancy failure on exactly the multi-turn
+MI cases this suite most needs to get right. `_format_judge_input` folds
+`case["history"]` into the judge-facing `input` as a transcript so the judge
+sees what the model actually saw. This only changes what the JUDGE reads;
+`_call_chatbot` still sends the real `history` array to /endpoint unchanged.
 """
 
 import os
@@ -116,6 +129,27 @@ def _call_chatbot(case: dict, max_retries: int = 2):
     )
 
 
+def _format_judge_input(case: dict) -> str:
+    """Builds the text handed to the LLM judge as `input`. See module
+    docstring "Judge context for multi-turn cases" -- GEval/AnswerRelevancy
+    only ever see this string plus `actual_output`, so a case with prior
+    `history` needs that history folded in as a transcript or the judge has
+    no way to know the model's response was a valid continuation of an
+    ongoing exchange rather than a reply to the final line in isolation.
+    """
+    history = case.get("history") or []
+    if not history:
+        return case["input"]
+    lines = ["[Prior conversation]"]
+    for turn in history:
+        speaker = "User" if turn.get("role") == "user" else "Assistant"
+        lines.append(f"{speaker}: {turn.get('content', '')}")
+    lines.append("")
+    lines.append("[Current message]")
+    lines.append(f"User: {case['input']}")
+    return "\n".join(lines)
+
+
 @pytest.mark.parametrize(
     "case", DATASET, ids=[c["input"][:40] for c in DATASET]
 )
@@ -123,7 +157,7 @@ def test_chatbot_response_quality(case):
     reply, retrieval_context = _call_chatbot(case)
 
     test_case = LLMTestCase(
-        input=case["input"],
+        input=_format_judge_input(case),
         actual_output=reply,
         retrieval_context=retrieval_context or None,
     )
