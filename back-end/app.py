@@ -14,7 +14,7 @@ from flask import Flask, request, jsonify, session, redirect
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
-from openai import OpenAI, RateLimitError
+from openai import OpenAI, RateLimitError, BadRequestError
 from pymongo import MongoClient
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -237,6 +237,47 @@ CRISIS_FALLBACK_APPENDIX = (
     "your care team. You don't have to go through this alone, and I'm here to keep "
     "talking with you whenever you're ready."
 )
+
+# Shown when OpenAI's own platform-level moderation rejects a request outright
+# (a 400 invalid_request_error, e.g. code="cyber_policy" for content flagged as
+# a possible cybersecurity risk) before any completion is generated at all.
+# This is fundamentally different from a rate limit or outage: it's a
+# deterministic, permanent rejection of this specific input by OpenAI itself,
+# not a transient failure or an app bug -- retrying the identical request will
+# fail identically every time, on either model. Respond the same way as any
+# other out-of-scope request (see the SCOPE BOUNDARY system-prompt section)
+# rather than surfacing a raw "AI call failed" 500, which previously gave
+# real users a broken "Something went wrong" experience for input that OpenAI
+# itself simply won't process, and (for the eval harnesses in evals/) looked
+# identical to a genuine outage and incorrectly halted a whole run over what
+# is actually a single, expected, per-prompt content-policy rejection.
+_CONTENT_POLICY_DECLINE_MESSAGE = (
+    "I can't help with that request — it was flagged by our safety systems "
+    "before I could even process it. If that seems wrong, try rephrasing, or "
+    "ask me about your LE8 scores, exercise/education content, or a SMART "
+    "goal instead."
+)
+
+
+def _is_openai_content_policy_block(e: Exception) -> bool:
+    """True if `e` is an OpenAI 400 invalid_request_error caused by OpenAI's
+    own content moderation (e.g. code="cyber_policy", "sexual_content_policy")
+    rather than some other 400 (malformed request, bad params, etc. -- an
+    actual bug we still want surfaced as a loud error, not swallowed).
+
+    Checked defensively across a few possible shapes since the exact
+    attribute the installed openai-python version exposes the parsed error
+    body under isn't guaranteed (`.code`, `.body`, or neither) -- falling
+    back to a substring check on str(e), which always contains the raw
+    `{"error": {..., "code": "..._policy"}}` payload OpenAI returns.
+    """
+    code = getattr(e, "code", None) or ""
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        code = code or (body.get("error") or {}).get("code", "") or ""
+    if isinstance(code, str) and code.endswith("_policy"):
+        return True
+    return "_policy'" in str(e) or '_policy"' in str(e)
 
 # ---------------------------------------------------------------------------
 # Exercise video library — loaded once at startup from Exercise Library.csv.
@@ -3537,8 +3578,24 @@ RESPONSE FORMAT:
   SMART goal synthesis (PHASE 2) is exempt from this word limit. Never drop or
   shorten any of the five SMART components, the schedule, or the follow-up
   questions in order to stay under 200 words.
-- When explaining an LE8 score, always include: the raw value, the score, the
-  tier, and one specific actionable step to improve it.
+- When the user is actually asking you to explain one of their OWN LE8
+  scores (they ask what a score/metric means, why it's at that level, or how
+  to improve it, AND you have real data for it), always include: the raw
+  value, the score, the tier, and one specific actionable step to improve
+  it. Deliver this in Motivational Interviewing style, same as the SMART
+  Goal and exercise-video flows: affirm that they asked (e.g. "Good
+  question — let's look at that."), do not just recite the four facts and
+  stop, and close with a brief open-ended question inviting them to react
+  to the step (e.g. "How does that sound as a starting point?" or "Is that
+  something that feels doable this week?") rather than treating the
+  explanation as complete once the facts are stated.
+  Do NOT apply this pattern outside genuine score-explanation requests —
+  in particular, do not volunteer LE8 tier definitions or scoring
+  boilerplate (e.g. "under 120/80 = Ideal") as a tangent in an answer to a
+  DIFFERENT question just because a related term (blood pressure, sleep,
+  BMI, etc.) is mentioned in passing. If the user has no LE8 data for that
+  metric yet, or isn't asking about their score at all, stay focused on
+  what they actually asked.
 - Plain language; avoid medical jargon unless the user uses it first.
 - When listing options, keep it to 2-3 choices to avoid overwhelming the user.
   EXCEPTION: the exercise preference questions [EV1] and [EV3] must be asked
@@ -3656,8 +3713,20 @@ RESPONSE FORMAT:
                     logger.error("gpt-4o fallback returned empty content")
                     return jsonify({"error": "AI call failed"}), 500
             except Exception as fallback_e:
-                logger.error("gpt-4o fallback also failed: %s", fallback_e)
-                return jsonify({"error": "AI call failed"}), 500
+                if isinstance(fallback_e, BadRequestError) and _is_openai_content_policy_block(fallback_e):
+                    logger.warning("gpt-4o fallback also content-policy-blocked: %s", fallback_e)
+                    reply = _CONTENT_POLICY_DECLINE_MESSAGE
+                else:
+                    logger.error("gpt-4o fallback also failed: %s", fallback_e)
+                    return jsonify({"error": "AI call failed"}), 500
+        elif isinstance(e, BadRequestError) and _is_openai_content_policy_block(e):
+            # OpenAI rejected this specific input outright -- see
+            # _CONTENT_POLICY_DECLINE_MESSAGE above for why this is not
+            # retried on gpt-4o: it's a platform-level content rejection,
+            # not a capacity/rate issue, so a second model is unlikely to
+            # behave differently on the same input.
+            logger.warning("OpenAI content-policy rejection (no fallback attempted): %s", e)
+            reply = _CONTENT_POLICY_DECLINE_MESSAGE
         else:
             logger.error("OpenAI call failed: %s", e)
             return jsonify({"error": "AI call failed"}), 500
