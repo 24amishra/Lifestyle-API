@@ -381,18 +381,33 @@ def load_retest_rows(prior_results_csv: str, min_score: int) -> list[dict]:
     of re-running the full 900-item set. Rows that errored last time (blank
     medsafetybench_score) are included too, since "unknown" also needs
     re-checking.
+
+    Also includes any row whose recorded model_answer is blank/whitespace,
+    REGARDLESS of its score -- an earlier baseline run had 54 rows where
+    /endpoint returned nothing and the MedSafetyBench judge scored the blank
+    text "1 = ideal refusal" by default (nothing to critique != a real
+    refusal). Those rows would otherwise be permanently invisible to
+    --retest: a passing score hides them from the score>=min_score check,
+    and older result CSVs from before call_chatbot's own empty-reply
+    detection was added don't have an "error" column to catch them either.
     """
     if not os.path.exists(prior_results_csv):
         raise FileNotFoundError(f"--retest path does not exist: {prior_results_csv}")
 
     rows = []
+    blank_answer_count = 0
     with open(prior_results_csv, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             score = row.get("medsafetybench_score", "")
             had_error = bool(row.get("error"))
-            failed_or_unknown = had_error or score == "" or int(score) >= min_score
+            blank_answer = not (row.get("model_answer") or "").strip()
+            failed_or_unknown = (
+                had_error or score == "" or int(score) >= min_score or blank_answer
+            )
             if not failed_or_unknown:
                 continue
+            if blank_answer:
+                blank_answer_count += 1
             rows.append({
                 "source": row["source"],
                 "category": row["category"],
@@ -401,8 +416,11 @@ def load_retest_rows(prior_results_csv: str, min_score: int) -> list[dict]:
             })
 
     print(
-        f"Loaded {len(rows)} previously-failing/unscored rows (score >= {min_score} "
-        f"or error/blank) from {prior_results_csv} to re-test."
+        f"Loaded {len(rows)} previously-failing/unscored rows (score >= {min_score}, "
+        f"error/blank, or blank model_answer"
+        + (f" [{blank_answer_count} of those were blank-answer rows with a "
+           f"deceptively passing score]" if blank_answer_count else "")
+        + f") from {prior_results_csv} to re-test."
     )
     return rows
 
@@ -446,6 +464,15 @@ def call_chatbot(client, message: str, max_retries: int = 2) -> tuple[str, str]:
     or a missing "reply" key (e.g. app.py's own per-IP rate limiter tripping,
     or an upstream OpenAI failure surfaced as {"error": "AI call failed"}) is
     retried with backoff rather than silently treated as an empty reply.
+
+    Also retries a 200 response whose "reply" is present but blank/whitespace
+    -- this genuinely happened in an earlier baseline run (54/900 rows came
+    back with a completely empty model_answer, which the MedSafetyBench
+    judge then misscored as "1 = ideal refusal" purely because there was
+    nothing to critique, silently inflating the reported refusal rate; those
+    rows were invisible to --retest since a blank reply isn't the same thing
+    as an error or a bad score). An empty reply is not a refusal, it's app.py
+    failing to produce content -- treat it the same as any other failure.
     """
     last_error = ""
     for attempt in range(max_retries + 1):
@@ -455,9 +482,13 @@ def call_chatbot(client, message: str, max_retries: int = 2) -> tuple[str, str]:
                 json={"message": message, "history": [], "le8_data": {}},
             )
             data = resp.get_json() or {}
+            reply = data.get("reply", "")
+            if resp.status_code == 200 and "reply" in data and reply.strip():
+                return reply, ""
             if resp.status_code == 200 and "reply" in data:
-                return data.get("reply", ""), ""
-            last_error = data.get("error", f"HTTP {resp.status_code}")
+                last_error = "empty reply from /endpoint"
+            else:
+                last_error = data.get("error", f"HTTP {resp.status_code}")
         except Exception as e:  # noqa: BLE001 - one bad row shouldn't kill the run
             last_error = f"ERROR: {e}"
         if attempt < max_retries:

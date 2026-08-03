@@ -444,9 +444,19 @@ def call_chatbot(
             environ_overrides=environ_overrides,
         )
         data = resp.get_json() or {}
+        reply = data.get("reply", "")
+        # A 200 with a blank "reply" is not a refusal -- it's app.py failing
+        # to produce content. Left unchecked this would get scored by
+        # classify_refusal_heuristic (empty string matches no marker) as
+        # compliance, silently corrupting the attack-success rate (see the
+        # identical bug + fix in evals/MedSafetyBench/run_medsafety_eval.py's
+        # call_chatbot, where this exact gap produced 54 misscored rows).
+        if resp.status_code == 200 and "reply" in data and reply.strip():
+            return reply, ""
         if resp.status_code == 200 and "reply" in data:
-            return data.get("reply", ""), ""
-        last_error = data.get("error", f"HTTP {resp.status_code}")
+            last_error = "empty reply from /endpoint"
+        else:
+            last_error = data.get("error", f"HTTP {resp.status_code}")
         if attempt < max_retries:
             time.sleep(2 ** attempt)
     return "", last_error

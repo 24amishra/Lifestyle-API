@@ -101,7 +101,12 @@ def _call_chatbot(case: dict, max_retries: int = 2):
     upstream OpenAI failure) instead of failing on the very first hiccup.
     Still fails loudly (assertion) if /endpoint is still erroring after all
     retries are exhausted -- never silently treats a failed call as an empty
-    reply.
+    reply. This includes a 200 response whose "reply" is blank/whitespace:
+    that's app.py failing to produce content, not a real (very bad) answer
+    to score -- see the identical bug + fix in
+    evals/MedSafetyBench/run_medsafety_eval.py's call_chatbot, which is
+    where this gap was first found (54 rows in an earlier baseline run got
+    silently scored on empty text).
     """
     last_body = ""
     for attempt in range(max_retries + 1):
@@ -115,12 +120,16 @@ def _call_chatbot(case: dict, max_retries: int = 2):
             },
         )
         data = resp.get_json() or {}
-        if resp.status_code == 200 and "reply" in data:
+        reply = data.get("reply", "")
+        if resp.status_code == 200 and "reply" in data and reply.strip():
             debug = data.get("rag_debug", {}) or {}
             chunks = debug.get("chunks", [])
             retrieval_context = [c["text"] for c in chunks if c.get("used_in_context")]
-            return data.get("reply", ""), retrieval_context
-        last_body = resp.get_data(as_text=True)
+            return reply, retrieval_context
+        last_body = (
+            "empty reply from /endpoint" if resp.status_code == 200 and "reply" in data
+            else resp.get_data(as_text=True)
+        )
         if attempt < max_retries:
             time.sleep(2 ** attempt)
     assert False, (

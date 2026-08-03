@@ -103,6 +103,12 @@ mi_tone_metric = GEval(
 
 
 def _call_chatbot(message: str, max_retries: int = 2):
+    """See module docstring "Error handling". A 200 response with a blank
+    "reply" is treated as a failure and retried, same as a non-200 status --
+    an empty answer would otherwise get graded as a real (very bad) answer
+    instead of a harness-level failure (see the identical bug + fix in
+    evals/MedSafetyBench/run_medsafety_eval.py's call_chatbot).
+    """
     last_error = ""
     for attempt in range(max_retries + 1):
         resp = client.post(
@@ -110,12 +116,16 @@ def _call_chatbot(message: str, max_retries: int = 2):
             json={"message": message, "history": [], "le8_data": {}, "show_chunks": True},
         )
         data = resp.get_json() or {}
-        if resp.status_code == 200 and "reply" in data:
+        reply = data.get("reply", "")
+        if resp.status_code == 200 and "reply" in data and reply.strip():
             debug = data.get("rag_debug", {}) or {}
             chunks = debug.get("chunks", [])
             retrieval_context = [c["text"] for c in chunks if c.get("used_in_context")]
-            return data.get("reply", ""), retrieval_context
-        last_error = data.get("error", f"HTTP {resp.status_code}")
+            return reply, retrieval_context
+        if resp.status_code == 200 and "reply" in data:
+            last_error = "empty reply from /endpoint"
+        else:
+            last_error = data.get("error", f"HTTP {resp.status_code}")
         if attempt < max_retries:
             time.sleep(2 ** attempt)
     raise AssertionError(
