@@ -1,0 +1,16 @@
+# Pinned to the exact versions tested end-to-end for this folder (see
+# README.md "Notes for whoever touches this next"). Do not bump casually:
+# trulens-core 2.10.0 (the latest as of writing) has a broken TP.submit
+# that silently drops all feedback scoring -- add_record()'s async dispatch
+# never raises, it just never calls the feedback function either, so
+# trulens_feedbacks stays empty with no error anywhere.
+trulens==2.9.0
+trulens-core==2.9.0
+trulens-feedback==2.9.0
+trulens-providers-openai==2.9.0
+trulens-dashboard==2.9.0
+trulens-otel-semconv==2.9.0
+trulens-eval==2.9.0
+
+python-dotenv
+pandas

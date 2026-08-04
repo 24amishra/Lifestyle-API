@@ -56,3 +56,7 @@ back-end/evals/**/generated/
 back-end/evals/**/results/
 back-end/evals/**/*.cache/
 .ragas_cache/
+
+back-end/evals/TruLens/flagged_records.json
+back-end/evals/TruLens/trulens_scored_results.csv
+back-end/evals/TruLens/*.sqlite
