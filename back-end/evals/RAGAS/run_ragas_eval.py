@@ -61,20 +61,51 @@ already uses this elsewhere in the repo) as an independent cross-check that
 has no noncommittal zero-out behavior. Compare the two `*_answer_relevancy`
 columns for rows where RAGAS's score looks suspiciously low.
 
-Output: evals/RAGAS/results/ragas_<tag>_<UTC timestamp>.csv
+Output: evals/RAGAS/results/ragas_<tag>.csv (no timestamp -- see "Crash
+safety" below for why)
 Each row: question, source ("manual"|"deepeval"), category, source_pdf,
 ground_truth, answer, retrieved_context (list, joined with "\n---\n" for
 CSV), ragas_faithfulness, ragas_answer_relevancy, ragas_context_precision,
 ragas_context_recall, deepeval_answer_relevancy, deepeval_answer_relevancy_reason.
+
+Crash safety / auto-resume / retry-then-stop
+-----------------------------------------------
+Same overall philosophy as evals/MedSafetyBench/run_medsafety_eval.py and
+evals/WildJailbreak/run_wildjailbreak_eval.py (retry each external call with
+backoff, stop the whole run rather than log-and-continue on a persistent
+failure, auto-resume on a re-run with the same --tag) but split across THREE
+checkpointed stages, because RAGAS's evaluate() call is architecturally a
+single atomic batch operation over the whole dataset -- it cannot be
+checkpointed row-by-row the way a simple per-row API loop can:
+
+  1. Fetch chatbot answers -> evals/RAGAS/results/ragas_<tag>_answers.csv
+     One /endpoint call per question, retried with backoff, checkpointed
+     (flushed) after every row. A persistent failure stops the run with
+     nothing written for that row; re-running the same command skips
+     already-fetched questions and retries from there.
+  2. Score with RAGAS -> evals/RAGAS/results/ragas_<tag>_ragas_scored.csv
+     One atomic evaluate() call over ALL fetched answers. If it fails, none
+     of this stage's results are cached -- but stage 1's answers are safe,
+     so a re-run skips straight back to re-attempting just this stage
+     (no wasted /endpoint calls). Once evaluate() succeeds, results are
+     cached to this file immediately so a later failure in stage 3 never
+     forces RAGAS to be re-run (real cost: LLM-judge calls per row).
+  3. Score with DeepEval AnswerRelevancyMetric (cross-check) -> the FINAL
+     output, evals/RAGAS/results/ragas_<tag>.csv. Per-row, retried with
+     backoff, checkpointed after every row, same stop-then-resume behavior
+     as stage 1.
+
+Use a different --tag (or delete the relevant results/ragas_<tag>_*.csv
+files) for a deliberately fresh run instead.
 """
 
 import argparse
 import csv
-import datetime
 import json
 import os
 import re
 import sys
+import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _BACKEND_DIR = os.path.dirname(os.path.dirname(_HERE))  # back-end/
@@ -238,17 +269,127 @@ def get_flask_test_client():
     return flask_app.test_client()
 
 
-def call_chatbot(client, question: str) -> tuple[str, list[str]]:
-    resp = client.post(
-        "/endpoint",
-        json={"message": question, "history": [], "le8_data": {}, "show_chunks": True},
-    )
-    data = resp.get_json() or {}
-    reply = data.get("reply", "")
-    debug = data.get("rag_debug", {}) or {}
-    chunks = debug.get("chunks", [])
-    retrieved_context = [c["text"] for c in chunks if c.get("used_in_context")]
-    return reply, retrieved_context
+def call_chatbot(
+    client, question: str, max_retries: int = 2
+) -> tuple[str, list[str], str]:
+    """Returns (answer, retrieved_context, error). `error` is empty on success.
+    A 200 response with a blank "reply" is treated as a failure and retried,
+    same as a non-200 status -- an empty answer would otherwise get scored by
+    RAGAS/DeepEval as a real (very bad) answer instead of a harness-level
+    failure (see the identical bug + fix in
+    evals/MedSafetyBench/run_medsafety_eval.py's call_chatbot).
+    """
+    last_error = ""
+    for attempt in range(max_retries + 1):
+        resp = client.post(
+            "/endpoint",
+            json={"message": question, "history": [], "le8_data": {}, "show_chunks": True},
+        )
+        data = resp.get_json() or {}
+        reply = data.get("reply", "")
+        if resp.status_code == 200 and "reply" in data and reply.strip():
+            debug = data.get("rag_debug", {}) or {}
+            chunks = debug.get("chunks", [])
+            retrieved_context = [c["text"] for c in chunks if c.get("used_in_context")]
+            return reply, retrieved_context, ""
+        if resp.status_code == 200 and "reply" in data:
+            last_error = "empty reply from /endpoint"
+        else:
+            last_error = data.get("error", f"HTTP {resp.status_code}")
+        if attempt < max_retries:
+            time.sleep(2 ** attempt)
+    return "", [], last_error
+
+
+_ANSWER_FIELDNAMES = [
+    "question", "source", "category", "source_pdf", "ground_truth",
+    "answer", "retrieved_context_json", "error",
+]
+
+
+def fetch_answers(client, questions: list[dict], answers_path: str) -> list[dict]:
+    """Stage 1 of the pipeline (see module docstring "Crash safety"): calls
+    the chatbot for each question, checkpointing to answers_path after every
+    row so a persistent failure never loses already-fetched answers. Raises
+    SystemExit(1) (after printing a resume-friendly message) if it stops
+    early; only returns once every question has a fetched answer.
+    """
+    records = []
+    done_keys = set()
+    if os.path.exists(answers_path):
+        skipped_errors = 0
+        with open(answers_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("error"):
+                    # Not "done" -- drop so it's retried fresh below, and so
+                    # the file gets compacted once a fresh attempt succeeds.
+                    skipped_errors += 1
+                    continue
+                records.append(row)
+                done_keys.add(_normalize(row["question"]))
+        print(
+            f"Found {len(records)} already-fetched answers at {answers_path}"
+            + (f", {skipped_errors} previously-errored rows will be retried" if skipped_errors else "")
+            + " -- auto-resuming."
+        )
+        answers_file = open(answers_path, "w", newline="", encoding="utf-8")
+        writer = csv.DictWriter(answers_file, fieldnames=_ANSWER_FIELDNAMES)
+        writer.writeheader()
+        for r in records:
+            writer.writerow({k: r.get(k, "") for k in _ANSWER_FIELDNAMES})
+        answers_file.flush()
+    else:
+        answers_file = open(answers_path, "w", newline="", encoding="utf-8")
+        writer = csv.DictWriter(answers_file, fieldnames=_ANSWER_FIELDNAMES)
+        writer.writeheader()
+        answers_file.flush()
+
+    todo = [q for q in questions if _normalize(q["question"]) not in done_keys]
+    print(f"{len(todo)} questions left to fetch answers for ({len(questions) - len(todo)} already done).")
+
+    stopped_early = False
+    try:
+        for i, q in enumerate(todo, 1):
+            answer, retrieved_context, error = call_chatbot(client, q["question"])
+            if error:
+                print(f"\nStopping after {len(records)}/{len(questions)} answers fetched: "
+                      f"/endpoint failed after retries -- {error}\n"
+                      f"Nothing was recorded for this question. Progress so far is saved at "
+                      f"{answers_path}.\nJust re-run the same command (same --tag) to "
+                      f"auto-resume and retry this question.")
+                stopped_early = True
+                break
+            record = {
+                **q,
+                "answer": answer,
+                "retrieved_context_json": json.dumps(retrieved_context),
+                "error": "",
+            }
+            writer.writerow({k: record.get(k, "") for k in _ANSWER_FIELDNAMES})
+            answers_file.flush()
+            records.append(record)
+            print(f"  [{len(questions) - len(todo) + i}/{len(questions)}] {q['question'][:60]!r}")
+    except KeyboardInterrupt:
+        print(f"\nInterrupted after {len(records)}/{len(questions)} answers. "
+              f"Progress is saved at {answers_path}.\nJust re-run the same command "
+              f"to auto-resume.")
+        stopped_early = True
+    finally:
+        answers_file.close()
+
+    if stopped_early:
+        raise SystemExit(1)
+
+    by_key = {_normalize(r["question"]): r for r in records}
+    ordered = []
+    for q in questions:
+        r = by_key[_normalize(q["question"])]
+        ordered.append({
+            **q,
+            "answer": r["answer"],
+            "retrieved_context": json.loads(r["retrieved_context_json"]) if r.get("retrieved_context_json") else [],
+        })
+    return ordered
 
 
 # ---------------------------------------------------------------------------
@@ -319,8 +460,44 @@ def score_with_ragas(records: list[dict]) -> list[dict]:
     return records
 
 
+_FINAL_FIELDNAMES = [
+    "question", "source", "category", "source_pdf", "ground_truth", "answer",
+    "retrieved_context", "ragas_faithfulness", "ragas_answer_relevancy",
+    "ragas_context_precision", "ragas_context_recall",
+    "deepeval_answer_relevancy", "deepeval_answer_relevancy_reason",
+]
+# Everything up through the RAGAS columns -- stage 2's cache file, so a
+# stage-3 (DeepEval) failure never forces the atomic, LLM-judge-heavy RAGAS
+# evaluate() call to be repeated. See module docstring "Crash safety".
+_RAGAS_SCORED_FIELDNAMES = _FINAL_FIELDNAMES[:-2]
+
+
+def _write_ragas_scored_cache(records: list[dict], path: str) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_RAGAS_SCORED_FIELDNAMES)
+        writer.writeheader()
+        for r in records:
+            row = {k: r.get(k, "") for k in _RAGAS_SCORED_FIELDNAMES}
+            row["retrieved_context"] = "\n---\n".join(r.get("retrieved_context") or [])
+            writer.writerow(row)
+
+
+def _load_ragas_scored_cache(path: str) -> list[dict]:
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        r["retrieved_context"] = r["retrieved_context"].split("\n---\n") if r["retrieved_context"] else []
+        for k in ("ragas_faithfulness", "ragas_answer_relevancy",
+                  "ragas_context_precision", "ragas_context_recall"):
+            try:
+                r[k] = float(r[k])
+            except (TypeError, ValueError):
+                pass
+    return rows
+
+
 # ---------------------------------------------------------------------------
-# DeepEval answer-relevancy cross-check
+# DeepEval answer-relevancy cross-check (stage 3 -- the final output)
 #
 # RAGAS's answer_relevancy can force a 0.0 on answers that read as
 # "noncommittal" to its LLM judge -- a real risk for this app's
@@ -330,28 +507,100 @@ def score_with_ragas(records: list[dict]) -> list[dict]:
 # independent second opinion on the same answers.
 # ---------------------------------------------------------------------------
 
-def score_with_deepeval_relevancy(records: list[dict]) -> list[dict]:
+def score_with_deepeval_relevancy(
+    records: list[dict], out_path: str, max_retries: int = 2
+) -> list[dict]:
+    """Stage 3 of the pipeline (see module docstring "Crash safety"): scores
+    each row with DeepEval's AnswerRelevancyMetric, retried with backoff,
+    checkpointed to out_path (the FINAL output file) after every row. Stops
+    the run on a persistent per-row failure rather than silently recording an
+    empty/error score. Raises SystemExit(1) if it stops early.
+    """
     from deepeval.metrics import AnswerRelevancyMetric
     from deepeval.test_case import LLMTestCase
 
     metric = AnswerRelevancyMetric(threshold=0.6, include_reason=True)
+    out_fieldnames = _FINAL_FIELDNAMES + ["error"]
 
-    for i, r in enumerate(records, 1):
-        test_case = LLMTestCase(
-            input=r["question"],
-            actual_output=r["answer"],
-            retrieval_context=r["retrieved_context"] or None,
+    done = []
+    done_keys = set()
+    if os.path.exists(out_path):
+        skipped_errors = 0
+        with open(out_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("error"):
+                    skipped_errors += 1
+                    continue
+                done.append(row)
+                done_keys.add(_normalize(row["question"]))
+        print(
+            f"Found {len(done)} already-scored rows at {out_path}"
+            + (f", {skipped_errors} previously-errored rows will be retried" if skipped_errors else "")
+            + " -- auto-resuming."
         )
-        try:
-            metric.measure(test_case, _show_indicator=False)
-            r["deepeval_answer_relevancy"] = metric.score
-            r["deepeval_answer_relevancy_reason"] = metric.reason
-        except Exception as e:  # noqa: BLE001 - don't let one bad row kill the run
-            r["deepeval_answer_relevancy"] = ""
-            r["deepeval_answer_relevancy_reason"] = f"ERROR: {e}"
-        print(f"  [{i}/{len(records)}] deepeval_answer_relevancy="
-              f"{r['deepeval_answer_relevancy']}")
-    return records
+        out_file = open(out_path, "w", newline="", encoding="utf-8")
+        writer = csv.DictWriter(out_file, fieldnames=out_fieldnames)
+        writer.writeheader()
+        for r in done:
+            writer.writerow({k: r.get(k, "") for k in out_fieldnames})
+        out_file.flush()
+    else:
+        out_file = open(out_path, "w", newline="", encoding="utf-8")
+        writer = csv.DictWriter(out_file, fieldnames=out_fieldnames)
+        writer.writeheader()
+        out_file.flush()
+
+    todo = [r for r in records if _normalize(r["question"]) not in done_keys]
+    print(f"{len(todo)} rows left for DeepEval cross-check ({len(records) - len(todo)} already done).")
+
+    stopped_early = False
+    try:
+        for i, r in enumerate(todo, 1):
+            test_case = LLMTestCase(
+                input=r["question"],
+                actual_output=r["answer"],
+                retrieval_context=r["retrieved_context"] or None,
+            )
+            score, reason, last_error = "", "", ""
+            for attempt in range(max_retries + 1):
+                try:
+                    metric.measure(test_case, _show_indicator=False)
+                    score, reason, last_error = metric.score, metric.reason, ""
+                    break
+                except Exception as e:  # noqa: BLE001 - retried below
+                    last_error = str(e)
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+
+            if last_error:
+                print(f"\nStopping after {len(done)}/{len(records)} rows: DeepEval "
+                      f"AnswerRelevancyMetric failed after retries -- {last_error}\n"
+                      f"Nothing was recorded for this row. Progress so far is saved at "
+                      f"{out_path}.\nJust re-run the same command (same --tag) to "
+                      f"auto-resume -- fetching and RAGAS scoring are both cached "
+                      f"already, so only this row will be retried.")
+                stopped_early = True
+                break
+
+            row = {k: r.get(k, "") for k in _FINAL_FIELDNAMES}
+            row["retrieved_context"] = "\n---\n".join(r.get("retrieved_context") or [])
+            row["deepeval_answer_relevancy"] = score
+            row["deepeval_answer_relevancy_reason"] = reason
+            row["error"] = ""
+            writer.writerow(row)
+            out_file.flush()
+            done.append(row)
+            print(f"  [{len(records) - len(todo) + i}/{len(records)}] deepeval_answer_relevancy={score}")
+    except KeyboardInterrupt:
+        print(f"\nInterrupted after {len(done)}/{len(records)} rows. Progress is saved "
+              f"at {out_path}.\nJust re-run the same command to auto-resume.")
+        stopped_early = True
+    finally:
+        out_file.close()
+
+    if stopped_early:
+        raise SystemExit(1)
+    return done
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +620,14 @@ def main():
     )
     parser.add_argument(
         "--tag", default="baseline",
-        help="Version tag included in the output filename (e.g. 'baseline', 'post-fix-v1').",
+        help=(
+            "Names the output files (ragas_<tag>_answers.csv, "
+            "ragas_<tag>_ragas_scored.csv, ragas_<tag>.csv). Re-running with "
+            "the SAME tag automatically resumes each of the 3 stages from "
+            "wherever it left off -- see 'Crash safety' above. Use a "
+            "different --tag (or delete the existing files) to start a "
+            "completely fresh run instead."
+        ),
     )
     args = parser.parse_args()
 
@@ -379,45 +635,44 @@ def main():
     if args.limit:
         questions = questions[: args.limit]
 
+    os.makedirs(_RESULTS_DIR, exist_ok=True)
+    answers_path = os.path.join(_RESULTS_DIR, f"ragas_{args.tag}_answers.csv")
+    ragas_cache_path = os.path.join(_RESULTS_DIR, f"ragas_{args.tag}_ragas_scored.csv")
+    out_path = os.path.join(_RESULTS_DIR, f"ragas_{args.tag}.csv")
+
     client = get_flask_test_client()
 
-    print(f"Calling chatbot for {len(questions)} questions...")
-    records = []
-    for i, q in enumerate(questions, 1):
-        answer, retrieved_context = call_chatbot(client, q["question"])
-        records.append({
-            **q,
-            "answer": answer,
-            "retrieved_context": retrieved_context,
-        })
-        print(f"  [{i}/{len(questions)}] {q['question'][:60]!r}")
+    print(f"Fetching chatbot answers for {len(questions)} questions...")
+    records = fetch_answers(client, questions, answers_path)
 
-    print("Scoring with RAGAS (faithfulness, answer_relevancy, "
-          "context_precision, context_recall)...")
-    records = score_with_ragas(records)
+    if os.path.exists(ragas_cache_path):
+        print(f"Found cached RAGAS scores at {ragas_cache_path} -- skipping "
+              f"re-scoring (delete this file, or use a different --tag, to "
+              f"force a fresh RAGAS pass).")
+        records = _load_ragas_scored_cache(ragas_cache_path)
+    else:
+        print("Scoring with RAGAS (faithfulness, answer_relevancy, "
+              "context_precision, context_recall)...")
+        try:
+            records = score_with_ragas(records)
+        except Exception as e:
+            print(
+                f"\nRAGAS scoring failed: {e}\n"
+                f"This is a single atomic call over the whole dataset (RAGAS's "
+                f"evaluate() API has no partial/per-row checkpointing), so "
+                f"nothing from this batch is cached -- but your fetched "
+                f"chatbot answers ARE safe at {answers_path}. Just re-run the "
+                f"same command (same --tag); answer-fetching will be skipped "
+                f"(already done) and only RAGAS scoring will be retried."
+            )
+            raise
+        _write_ragas_scored_cache(records, ragas_cache_path)
+        print(f"Cached RAGAS scores to {ragas_cache_path}.")
 
     print("Scoring with DeepEval AnswerRelevancyMetric (cross-check)...")
-    records = score_with_deepeval_relevancy(records)
+    records = score_with_deepeval_relevancy(records, out_path)
 
-    os.makedirs(_RESULTS_DIR, exist_ok=True)
-    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_path = os.path.join(_RESULTS_DIR, f"ragas_{args.tag}_{timestamp}.csv")
-
-    fieldnames = [
-        "question", "source", "category", "source_pdf", "ground_truth", "answer",
-        "retrieved_context", "ragas_faithfulness", "ragas_answer_relevancy",
-        "ragas_context_precision", "ragas_context_recall",
-        "deepeval_answer_relevancy", "deepeval_answer_relevancy_reason",
-    ]
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in records:
-            row = dict(r)
-            row["retrieved_context"] = "\n---\n".join(row["retrieved_context"])
-            writer.writerow(row)
-
-    print(f"Saved {len(records)} scored rows to {out_path}")
+    print(f"\nSaved {len(records)} scored rows to {out_path}")
 
 
 if __name__ == "__main__":

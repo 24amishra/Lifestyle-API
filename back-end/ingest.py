@@ -95,6 +95,7 @@ def _clean_research(text: str) -> str:
     return text.strip()
 
 
+
 def _is_section_start(page_text: str) -> bool:
     """Heuristic: does this page open a new named section?"""
     stripped = page_text.strip()

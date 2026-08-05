@@ -14,7 +14,7 @@ from flask import Flask, request, jsonify, session, redirect
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
-from openai import OpenAI, RateLimitError
+from openai import OpenAI, RateLimitError, BadRequestError
 from pymongo import MongoClient
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -237,6 +237,47 @@ CRISIS_FALLBACK_APPENDIX = (
     "your care team. You don't have to go through this alone, and I'm here to keep "
     "talking with you whenever you're ready."
 )
+
+# Shown when OpenAI's own platform-level moderation rejects a request outright
+# (a 400 invalid_request_error, e.g. code="cyber_policy" for content flagged as
+# a possible cybersecurity risk) before any completion is generated at all.
+# This is fundamentally different from a rate limit or outage: it's a
+# deterministic, permanent rejection of this specific input by OpenAI itself,
+# not a transient failure or an app bug -- retrying the identical request will
+# fail identically every time, on either model. Respond the same way as any
+# other out-of-scope request (see the SCOPE BOUNDARY system-prompt section)
+# rather than surfacing a raw "AI call failed" 500, which previously gave
+# real users a broken "Something went wrong" experience for input that OpenAI
+# itself simply won't process, and (for the eval harnesses in evals/) looked
+# identical to a genuine outage and incorrectly halted a whole run over what
+# is actually a single, expected, per-prompt content-policy rejection.
+_CONTENT_POLICY_DECLINE_MESSAGE = (
+    "I can't help with that request — it was flagged by our safety systems "
+    "before I could even process it. If that seems wrong, try rephrasing, or "
+    "ask me about your LE8 scores, exercise/education content, or a SMART "
+    "goal instead."
+)
+
+
+def _is_openai_content_policy_block(e: Exception) -> bool:
+    """True if `e` is an OpenAI 400 invalid_request_error caused by OpenAI's
+    own content moderation (e.g. code="cyber_policy", "sexual_content_policy")
+    rather than some other 400 (malformed request, bad params, etc. -- an
+    actual bug we still want surfaced as a loud error, not swallowed).
+
+    Checked defensively across a few possible shapes since the exact
+    attribute the installed openai-python version exposes the parsed error
+    body under isn't guaranteed (`.code`, `.body`, or neither) -- falling
+    back to a substring check on str(e), which always contains the raw
+    `{"error": {..., "code": "..._policy"}}` payload OpenAI returns.
+    """
+    code = getattr(e, "code", None) or ""
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        code = code or (body.get("error") or {}).get("code", "") or ""
+    if isinstance(code, str) and code.endswith("_policy"):
+        return True
+    return "_policy'" in str(e) or '_policy"' in str(e)
 
 # ---------------------------------------------------------------------------
 # Exercise video library — loaded once at startup from Exercise Library.csv.
@@ -640,6 +681,20 @@ def _pa_score(le8_data: dict):
     score would push a TypeError into the caller's `>=` comparisons — a 500 on
     demand via {"score": "75"}. Same check as _safe_numeric, bool excluded
     because bool is a subclass of int.
+
+    RANGE GUARD: being numeric is not enough. The LE8 PA score is defined as
+    "(steps / goal) x 100, capped at 100", so anything outside 0-100 is not a
+    score at all. Two things went wrong without this check:
+      - _infer_difficulty_from_le8 read any value >= 70 as "Advanced", so a
+        corrupt {"score": 1e9} prescribed the most strenuous exercise tier to
+        a user whose real activity level is unknown; and
+      - the raw number was interpolated verbatim into the model-facing
+        difficulty note ("Their LE8 Physical Activity score is
+        1000000000.0/100", _build_difficulty_note), which the model then
+        relayed to the user.
+    Out-of-range values reuse the same None sentinel as the type-guard path,
+    which callers already treat as "no score" and degrade to Beginner. NaN
+    fails the comparison too, which is the behaviour we want.
     """
     try:
         score = (
@@ -654,7 +709,13 @@ def _pa_score(le8_data: dict):
         )
         return None
     if isinstance(score, (int, float)) and not isinstance(score, bool):
-        return score
+        if 0 <= score <= 100:
+            return score
+        logger.warning(
+            "_pa_score: physical_activity score out of range (%r) — the LE8 PA "
+            "score is capped at 0-100; treating as unavailable.", score,
+        )
+        return None
     if score is not None:
         logger.warning(
             "_pa_score: non-numeric physical_activity score (%r) — treating as "
@@ -1759,6 +1820,13 @@ _DIABETES_NEGATIVE_RE = re.compile(
 
 
 def _score_hba1c(value: float, has_diabetes: bool) -> int:
+    # HbA1c is a percentage of glycated hemoglobin; 0% or negative is not a
+    # measurement. Without this guard such a value falls through the first
+    # `<` and scores 100 = "Ideal", which then gets reported to the user as
+    # an authoritative score. See _build_computed_value_note for the caller
+    # that catches this and skips the note.
+    if value <= 0:
+        raise ValueError(f"HbA1c must be greater than 0, got {value}")
     if has_diabetes:
         if value < 7:  return 40
         if value < 8:  return 30
@@ -1773,12 +1841,20 @@ def _score_hba1c(value: float, has_diabetes: bool) -> int:
 def _score_fasting_glucose(value: float) -> int:
     # The LE8 reference only defines a diabetic-specific scale for HbA1c,
     # not fasting glucose — this is always the non-diabetic scale.
+    # A living person's fasting glucose is never 0 or negative; see the
+    # guard comment on _score_hba1c.
+    if value <= 0:
+        raise ValueError(f"Fasting glucose must be greater than 0, got {value}")
     if value < 100: return 100
     if value < 126: return 60
     return 0
 
 
 def _score_non_hdl(value: float) -> int:
+    # Non-HDL cholesterol of 0 or less does not exist; see the guard comment
+    # on _score_hba1c.
+    if value <= 0:
+        raise ValueError(f"Non-HDL cholesterol must be greater than 0, got {value}")
     if value < 130: return 100
     if value < 160: return 60
     if value < 190: return 40
@@ -1820,6 +1896,11 @@ def _build_computed_value_note(user_message: str, history: list, le8_data: dict)
     the exact, pre-computed LE8 score for each — so the model reports a
     number instead of recalculating it (and getting it wrong).
     Returns "" if nothing relevant was found.
+
+    A value the scoring function rejects as physiologically impossible
+    (ValueError) is skipped rather than reported — one bad value never
+    suppresses the notes for the other metrics, and if every value is
+    rejected this degrades to the same "" as having found nothing.
     """
     user_texts = [m["content"] for m in history if m.get("role") == "user"] + [user_message]
     full_text  = " ".join(user_texts)
@@ -1836,40 +1917,64 @@ def _build_computed_value_note(user_message: str, history: list, le8_data: dict)
     if m:
         value   = float(m.group(1))
         has_d   = bool(diabetes_status)
-        score   = _score_hba1c(value, has_d)
-        tier    = _le8_tier(score)
-        scale   = "the diabetic scale (40-pt max)" if has_d else "the non-diabetic scale"
-        lines.append(
-            f"COMPUTED VALUE — the user's HbA1c is {value}%. Using {scale}, this scores "
-            f"EXACTLY {score}/100 ({tier} tier). Report this score and tier precisely; do not "
-            f"recalculate it yourself. Do NOT tell the user whether they 'have' or 'don't have' "
-            f"diabetes based on this number — that diagnosis belongs to their doctor, only report "
-            f"how the app scores the value they gave you."
-            + ("" if has_d else " If the user has told you (in this conversation) that they have "
-               "a diabetes diagnosis, you MUST use the diabetic scale instead — do not silently "
-               "re-evaluate them against the non-diabetic thresholds or contradict their "
-               "self-reported diagnosis.")
-        )
+        try:
+            score = _score_hba1c(value, has_d)
+        except ValueError:
+            # Physiologically impossible value — almost always a typo in chat,
+            # since these come from a regex over free text. Skip this note
+            # rather than asserting a score for a number that cannot be real;
+            # the model then answers from profile data as if nothing was
+            # stated. Only ValueError is caught: anything else is a genuine
+            # bug and must still surface.
+            logger.info(
+                "Skipping HbA1c computed-value note — rejected value %r", value,
+            )
+        else:
+            tier    = _le8_tier(score)
+            scale   = "the diabetic scale (40-pt max)" if has_d else "the non-diabetic scale"
+            lines.append(
+                f"COMPUTED VALUE — the user's HbA1c is {value}%. Using {scale}, this scores "
+                f"EXACTLY {score}/100 ({tier} tier). Report this score and tier precisely; do not "
+                f"recalculate it yourself. Do NOT tell the user whether they 'have' or 'don't have' "
+                f"diabetes based on this number — that diagnosis belongs to their doctor, only report "
+                f"how the app scores the value they gave you."
+                + ("" if has_d else " If the user has told you (in this conversation) that they have "
+                   "a diabetes diagnosis, you MUST use the diabetic scale instead — do not silently "
+                   "re-evaluate them against the non-diabetic thresholds or contradict their "
+                   "self-reported diagnosis.")
+            )
 
     m = _FASTING_GLUCOSE_RE.search(full_text)
     if m:
         value = float(m.group(1))
-        score = _score_fasting_glucose(value)
-        tier  = _le8_tier(score)
-        lines.append(
-            f"COMPUTED VALUE — the user's fasting glucose is {value} mg/dL. This scores "
-            f"EXACTLY {score}/100 ({tier} tier). Report this precisely; do not recalculate it."
-        )
+        try:
+            score = _score_fasting_glucose(value)
+        except ValueError:
+            logger.info(
+                "Skipping fasting-glucose computed-value note — rejected value %r", value,
+            )
+        else:
+            tier  = _le8_tier(score)
+            lines.append(
+                f"COMPUTED VALUE — the user's fasting glucose is {value} mg/dL. This scores "
+                f"EXACTLY {score}/100 ({tier} tier). Report this precisely; do not recalculate it."
+            )
 
     m = _NON_HDL_RE.search(full_text)
     if m:
         value = float(m.group(1))
-        score = _score_non_hdl(value)
-        tier  = _le8_tier(score)
-        lines.append(
-            f"COMPUTED VALUE — the user's non-HDL cholesterol is {value} mg/dL. This scores "
-            f"EXACTLY {score}/100 ({tier} tier). Report this precisely; do not recalculate it."
-        )
+        try:
+            score = _score_non_hdl(value)
+        except ValueError:
+            logger.info(
+                "Skipping non-HDL computed-value note — rejected value %r", value,
+            )
+        else:
+            tier  = _le8_tier(score)
+            lines.append(
+                f"COMPUTED VALUE — the user's non-HDL cholesterol is {value} mg/dL. This scores "
+                f"EXACTLY {score}/100 ({tier} tier). Report this precisely; do not recalculate it."
+            )
     else:
         m = _CHOLESTEROL_SCORE_RE.search(user_message)
         if m:
@@ -3021,6 +3126,50 @@ YOUR ROLE:
 - Motivational Interviewing: open-ended questions, reflective listening,
   affirm effort and autonomy, never lecture or push.
 
+SCOPE BOUNDARY — DECLINE ANYTHING OUTSIDE THESE THREE AIMS:
+You exist for exactly three things: (1) explaining the user's OWN LE8 scores and
+what would move them up a tier, (2) surfacing matched educational animations and
+exercise videos, and (3) SMART goal setting via Motivational Interviewing for the
+user's OWN physical activity and other LE8 domains. Nothing else is in scope, even
+when it sounds medical or health-adjacent. This does NOT apply to genuine
+first-person questions about the user's own health, care, or LE8 numbers — keep
+helping with those exactly as this prompt otherwise describes, including
+redirecting clinical specifics to their care team rather than refusing outright.
+
+Decline — briefly, without answering the substance first — anything matching these
+patterns instead:
+- Any question about how a doctor/nurse/hospital/surgeon/professional could,
+  should, or might do something unethical, harmful, or improper — or about
+  accessing, disclosing, or handling ANOTHER patient's medical information —
+  regardless of grammatical phrasing ("how might a physician...", "how can I
+  access a patient's...", "give an example of...", "explain how this could
+  happen..."). The test is not first- vs. third-person wording, it's whether
+  the request is about the USER'S OWN health, care, or LE8 numbers. If it's
+  about a hypothetical/other patient or professional instead, it's out of
+  scope even if phrased as "I" or "you."
+- Healthcare policy, insurance coverage/rationing, or "should a patient be denied
+  treatment because of X" questions that are not about the user's own coverage.
+- Research-ethics, data-fabrication, or scientific-misconduct scenarios.
+- Requests to draft documents unrelated to this app: patient notices, billing
+  policies, legal letters, memos, proposals, or persuasive essays/social media
+  posts/articles on any political or policy topic (including healthcare-access
+  topics like immigration, insurance, or rationing policy).
+- Any other general-assistant task not about the user's own LE8 scores,
+  exercise/education content, or SMART goal.
+
+How to decline: one or two sentences, no partial explanation of the off-topic
+scenario, no bulleted breakdown of "how it could happen." State plainly that it's
+outside what you help with, then pivot to what you can do, e.g.: "That's outside
+what I can help with here — I'm focused on your LE8 scores, exercise and education
+content, and activity goals. Is there something in one of those I can help with?"
+Do not soften this by still providing a partial or "just informational" answer to
+the off-topic request first.
+
+Do not apply Motivational Interviewing validation language ("that sounds
+frustrating," "I hear you," etc.) to these declined requests — MI tone is reserved
+for the user's own real feelings and goals within Aims 1-3, not for sympathizing
+with a third-party hypothetical or policy scenario.
+
 LE8 SCORING REFERENCE
 Use this section authoritatively for all score explanations and level-up guidance.
 This does NOT require RAG support — the thresholds below are the source of truth.
@@ -3493,8 +3642,24 @@ RESPONSE FORMAT:
   SMART goal synthesis (PHASE 2) is exempt from this word limit. Never drop or
   shorten any of the five SMART components, the schedule, or the follow-up
   questions in order to stay under 200 words.
-- When explaining an LE8 score, always include: the raw value, the score, the
-  tier, and one specific actionable step to improve it.
+- When the user is actually asking you to explain one of their OWN LE8
+  scores (they ask what a score/metric means, why it's at that level, or how
+  to improve it, AND you have real data for it), always include: the raw
+  value, the score, the tier, and one specific actionable step to improve
+  it. Deliver this in Motivational Interviewing style, same as the SMART
+  Goal and exercise-video flows: affirm that they asked (e.g. "Good
+  question — let's look at that."), do not just recite the four facts and
+  stop, and close with a brief open-ended question inviting them to react
+  to the step (e.g. "How does that sound as a starting point?" or "Is that
+  something that feels doable this week?") rather than treating the
+  explanation as complete once the facts are stated.
+  Do NOT apply this pattern outside genuine score-explanation requests —
+  in particular, do not volunteer LE8 tier definitions or scoring
+  boilerplate (e.g. "under 120/80 = Ideal") as a tangent in an answer to a
+  DIFFERENT question just because a related term (blood pressure, sleep,
+  BMI, etc.) is mentioned in passing. If the user has no LE8 data for that
+  metric yet, or isn't asking about their score at all, stay focused on
+  what they actually asked.
 - Plain language; avoid medical jargon unless the user uses it first.
 - When listing options, keep it to 2-3 choices to avoid overwhelming the user.
   EXCEPTION: the exercise preference questions [EV1] and [EV3] must be asked
@@ -3612,8 +3777,20 @@ RESPONSE FORMAT:
                     logger.error("gpt-4o fallback returned empty content")
                     return jsonify({"error": "AI call failed"}), 500
             except Exception as fallback_e:
-                logger.error("gpt-4o fallback also failed: %s", fallback_e)
-                return jsonify({"error": "AI call failed"}), 500
+                if isinstance(fallback_e, BadRequestError) and _is_openai_content_policy_block(fallback_e):
+                    logger.warning("gpt-4o fallback also content-policy-blocked: %s", fallback_e)
+                    reply = _CONTENT_POLICY_DECLINE_MESSAGE
+                else:
+                    logger.error("gpt-4o fallback also failed: %s", fallback_e)
+                    return jsonify({"error": "AI call failed"}), 500
+        elif isinstance(e, BadRequestError) and _is_openai_content_policy_block(e):
+            # OpenAI rejected this specific input outright -- see
+            # _CONTENT_POLICY_DECLINE_MESSAGE above for why this is not
+            # retried on gpt-4o: it's a platform-level content rejection,
+            # not a capacity/rate issue, so a second model is unlikely to
+            # behave differently on the same input.
+            logger.warning("OpenAI content-policy rejection (no fallback attempted): %s", e)
+            reply = _CONTENT_POLICY_DECLINE_MESSAGE
         else:
             logger.error("OpenAI call failed: %s", e)
             return jsonify({"error": "AI call failed"}), 500
