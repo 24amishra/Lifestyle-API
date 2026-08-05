@@ -681,6 +681,20 @@ def _pa_score(le8_data: dict):
     score would push a TypeError into the caller's `>=` comparisons — a 500 on
     demand via {"score": "75"}. Same check as _safe_numeric, bool excluded
     because bool is a subclass of int.
+
+    RANGE GUARD: being numeric is not enough. The LE8 PA score is defined as
+    "(steps / goal) x 100, capped at 100", so anything outside 0-100 is not a
+    score at all. Two things went wrong without this check:
+      - _infer_difficulty_from_le8 read any value >= 70 as "Advanced", so a
+        corrupt {"score": 1e9} prescribed the most strenuous exercise tier to
+        a user whose real activity level is unknown; and
+      - the raw number was interpolated verbatim into the model-facing
+        difficulty note ("Their LE8 Physical Activity score is
+        1000000000.0/100", _build_difficulty_note), which the model then
+        relayed to the user.
+    Out-of-range values reuse the same None sentinel as the type-guard path,
+    which callers already treat as "no score" and degrade to Beginner. NaN
+    fails the comparison too, which is the behaviour we want.
     """
     try:
         score = (
@@ -695,7 +709,13 @@ def _pa_score(le8_data: dict):
         )
         return None
     if isinstance(score, (int, float)) and not isinstance(score, bool):
-        return score
+        if 0 <= score <= 100:
+            return score
+        logger.warning(
+            "_pa_score: physical_activity score out of range (%r) — the LE8 PA "
+            "score is capped at 0-100; treating as unavailable.", score,
+        )
+        return None
     if score is not None:
         logger.warning(
             "_pa_score: non-numeric physical_activity score (%r) — treating as "
@@ -1800,6 +1820,13 @@ _DIABETES_NEGATIVE_RE = re.compile(
 
 
 def _score_hba1c(value: float, has_diabetes: bool) -> int:
+    # HbA1c is a percentage of glycated hemoglobin; 0% or negative is not a
+    # measurement. Without this guard such a value falls through the first
+    # `<` and scores 100 = "Ideal", which then gets reported to the user as
+    # an authoritative score. See _build_computed_value_note for the caller
+    # that catches this and skips the note.
+    if value <= 0:
+        raise ValueError(f"HbA1c must be greater than 0, got {value}")
     if has_diabetes:
         if value < 7:  return 40
         if value < 8:  return 30
@@ -1814,12 +1841,20 @@ def _score_hba1c(value: float, has_diabetes: bool) -> int:
 def _score_fasting_glucose(value: float) -> int:
     # The LE8 reference only defines a diabetic-specific scale for HbA1c,
     # not fasting glucose — this is always the non-diabetic scale.
+    # A living person's fasting glucose is never 0 or negative; see the
+    # guard comment on _score_hba1c.
+    if value <= 0:
+        raise ValueError(f"Fasting glucose must be greater than 0, got {value}")
     if value < 100: return 100
     if value < 126: return 60
     return 0
 
 
 def _score_non_hdl(value: float) -> int:
+    # Non-HDL cholesterol of 0 or less does not exist; see the guard comment
+    # on _score_hba1c.
+    if value <= 0:
+        raise ValueError(f"Non-HDL cholesterol must be greater than 0, got {value}")
     if value < 130: return 100
     if value < 160: return 60
     if value < 190: return 40
@@ -1861,6 +1896,11 @@ def _build_computed_value_note(user_message: str, history: list, le8_data: dict)
     the exact, pre-computed LE8 score for each — so the model reports a
     number instead of recalculating it (and getting it wrong).
     Returns "" if nothing relevant was found.
+
+    A value the scoring function rejects as physiologically impossible
+    (ValueError) is skipped rather than reported — one bad value never
+    suppresses the notes for the other metrics, and if every value is
+    rejected this degrades to the same "" as having found nothing.
     """
     user_texts = [m["content"] for m in history if m.get("role") == "user"] + [user_message]
     full_text  = " ".join(user_texts)
@@ -1877,40 +1917,64 @@ def _build_computed_value_note(user_message: str, history: list, le8_data: dict)
     if m:
         value   = float(m.group(1))
         has_d   = bool(diabetes_status)
-        score   = _score_hba1c(value, has_d)
-        tier    = _le8_tier(score)
-        scale   = "the diabetic scale (40-pt max)" if has_d else "the non-diabetic scale"
-        lines.append(
-            f"COMPUTED VALUE — the user's HbA1c is {value}%. Using {scale}, this scores "
-            f"EXACTLY {score}/100 ({tier} tier). Report this score and tier precisely; do not "
-            f"recalculate it yourself. Do NOT tell the user whether they 'have' or 'don't have' "
-            f"diabetes based on this number — that diagnosis belongs to their doctor, only report "
-            f"how the app scores the value they gave you."
-            + ("" if has_d else " If the user has told you (in this conversation) that they have "
-               "a diabetes diagnosis, you MUST use the diabetic scale instead — do not silently "
-               "re-evaluate them against the non-diabetic thresholds or contradict their "
-               "self-reported diagnosis.")
-        )
+        try:
+            score = _score_hba1c(value, has_d)
+        except ValueError:
+            # Physiologically impossible value — almost always a typo in chat,
+            # since these come from a regex over free text. Skip this note
+            # rather than asserting a score for a number that cannot be real;
+            # the model then answers from profile data as if nothing was
+            # stated. Only ValueError is caught: anything else is a genuine
+            # bug and must still surface.
+            logger.info(
+                "Skipping HbA1c computed-value note — rejected value %r", value,
+            )
+        else:
+            tier    = _le8_tier(score)
+            scale   = "the diabetic scale (40-pt max)" if has_d else "the non-diabetic scale"
+            lines.append(
+                f"COMPUTED VALUE — the user's HbA1c is {value}%. Using {scale}, this scores "
+                f"EXACTLY {score}/100 ({tier} tier). Report this score and tier precisely; do not "
+                f"recalculate it yourself. Do NOT tell the user whether they 'have' or 'don't have' "
+                f"diabetes based on this number — that diagnosis belongs to their doctor, only report "
+                f"how the app scores the value they gave you."
+                + ("" if has_d else " If the user has told you (in this conversation) that they have "
+                   "a diabetes diagnosis, you MUST use the diabetic scale instead — do not silently "
+                   "re-evaluate them against the non-diabetic thresholds or contradict their "
+                   "self-reported diagnosis.")
+            )
 
     m = _FASTING_GLUCOSE_RE.search(full_text)
     if m:
         value = float(m.group(1))
-        score = _score_fasting_glucose(value)
-        tier  = _le8_tier(score)
-        lines.append(
-            f"COMPUTED VALUE — the user's fasting glucose is {value} mg/dL. This scores "
-            f"EXACTLY {score}/100 ({tier} tier). Report this precisely; do not recalculate it."
-        )
+        try:
+            score = _score_fasting_glucose(value)
+        except ValueError:
+            logger.info(
+                "Skipping fasting-glucose computed-value note — rejected value %r", value,
+            )
+        else:
+            tier  = _le8_tier(score)
+            lines.append(
+                f"COMPUTED VALUE — the user's fasting glucose is {value} mg/dL. This scores "
+                f"EXACTLY {score}/100 ({tier} tier). Report this precisely; do not recalculate it."
+            )
 
     m = _NON_HDL_RE.search(full_text)
     if m:
         value = float(m.group(1))
-        score = _score_non_hdl(value)
-        tier  = _le8_tier(score)
-        lines.append(
-            f"COMPUTED VALUE — the user's non-HDL cholesterol is {value} mg/dL. This scores "
-            f"EXACTLY {score}/100 ({tier} tier). Report this precisely; do not recalculate it."
-        )
+        try:
+            score = _score_non_hdl(value)
+        except ValueError:
+            logger.info(
+                "Skipping non-HDL computed-value note — rejected value %r", value,
+            )
+        else:
+            tier  = _le8_tier(score)
+            lines.append(
+                f"COMPUTED VALUE — the user's non-HDL cholesterol is {value} mg/dL. This scores "
+                f"EXACTLY {score}/100 ({tier} tier). Report this precisely; do not recalculate it."
+            )
     else:
         m = _CHOLESTEROL_SCORE_RE.search(user_message)
         if m:
